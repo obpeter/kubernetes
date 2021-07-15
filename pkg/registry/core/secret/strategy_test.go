@@ -17,92 +17,18 @@ limitations under the License.
 package secret
 
 import (
-	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/testapi"
 	apitesting "k8s.io/kubernetes/pkg/api/testing"
-	"k8s.io/kubernetes/pkg/runtime"
+	api "k8s.io/kubernetes/pkg/apis/core"
+
+	// ensure types are installed
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
 )
-
-func TestExportSecret(t *testing.T) {
-	tests := []struct {
-		objIn     runtime.Object
-		objOut    runtime.Object
-		exact     bool
-		expectErr bool
-	}{
-		{
-			objIn: &api.Secret{
-				ObjectMeta: api.ObjectMeta{
-					Name:      "foo",
-					Namespace: "bar",
-				},
-				Data: map[string][]byte{
-					"foo": []byte("bar"),
-				},
-			},
-			objOut: &api.Secret{
-				ObjectMeta: api.ObjectMeta{
-					Name:      "foo",
-					Namespace: "bar",
-				},
-				Data: map[string][]byte{
-					"foo": []byte("bar"),
-				},
-			},
-			exact: true,
-		},
-		{
-			objIn: &api.Secret{
-				ObjectMeta: api.ObjectMeta{
-					Name:      "foo",
-					Namespace: "bar",
-				},
-				Type: api.SecretTypeServiceAccountToken,
-			},
-			expectErr: true,
-		},
-		{
-			objIn: &api.Secret{
-				ObjectMeta: api.ObjectMeta{
-					Name:      "foo",
-					Namespace: "bar",
-					Annotations: map[string]string{
-						api.ServiceAccountUIDKey: "true",
-					},
-				},
-			},
-			expectErr: true,
-		},
-		{
-			objIn:     &api.Pod{},
-			expectErr: true,
-		},
-	}
-
-	for _, test := range tests {
-		err := Strategy.Export(api.NewContext(), test.objIn, test.exact)
-		if err != nil {
-			if !test.expectErr {
-				t.Errorf("unexpected error: %v", err)
-			}
-			continue
-		}
-		if test.expectErr {
-			t.Error("unexpected non-error")
-			continue
-		}
-		if !reflect.DeepEqual(test.objIn, test.objOut) {
-			t.Errorf("expected:\n%v\nsaw:\n%v\n", test.objOut, test.objIn)
-		}
-	}
-}
 
 func TestSelectableFieldLabelConversions(t *testing.T) {
 	apitesting.TestSelectableFieldLabelConversionsOfKind(t,
-		testapi.Default.GroupVersion().String(),
+		"v1",
 		"Secret",
 		SelectableFields(&api.Secret{}),
 		nil,

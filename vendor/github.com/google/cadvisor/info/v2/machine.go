@@ -31,6 +31,9 @@ type Attributes struct {
 	// Docker version.
 	DockerVersion string `json:"docker_version"`
 
+	// Docker API version.
+	DockerAPIVersion string `json:"docker_api_version"`
+
 	// cAdvisor version.
 	CadvisorVersion string `json:"cadvisor_version"`
 
@@ -48,6 +51,9 @@ type Attributes struct {
 
 	// The system uuid
 	SystemUUID string `json:"system_uuid"`
+
+	// HugePages on this machine.
+	HugePages []v1.HugePagesInfo `json:"hugepages"`
 
 	// Filesystems on this machine.
 	Filesystems []v1.FsInfo `json:"filesystems"`
@@ -74,12 +80,14 @@ func GetAttributes(mi *v1.MachineInfo, vi *v1.VersionInfo) Attributes {
 		KernelVersion:      vi.KernelVersion,
 		ContainerOsVersion: vi.ContainerOsVersion,
 		DockerVersion:      vi.DockerVersion,
+		DockerAPIVersion:   vi.DockerAPIVersion,
 		CadvisorVersion:    vi.CadvisorVersion,
 		NumCores:           mi.NumCores,
 		CpuFrequency:       mi.CpuFrequency,
 		MemoryCapacity:     mi.MemoryCapacity,
 		MachineID:          mi.MachineID,
 		SystemUUID:         mi.SystemUUID,
+		HugePages:          mi.HugePages,
 		Filesystems:        mi.Filesystems,
 		DiskMap:            mi.DiskMap,
 		NetworkDevices:     mi.NetworkDevices,

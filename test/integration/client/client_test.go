@@ -1,5 +1,3 @@
-// +build integration,!no-etcd
-
 /*
 Copyright 2014 The Kubernetes Authors.
 
@@ -19,6 +17,7 @@ limitations under the License.
 package client
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"reflect"
@@ -27,30 +26,40 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	apierrors "k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/client/restclient"
-	client "k8s.io/kubernetes/pkg/client/unversioned"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/wait"
-	"k8s.io/kubernetes/pkg/version"
-	"k8s.io/kubernetes/pkg/watch"
-	e2e "k8s.io/kubernetes/test/e2e/framework"
+	"github.com/google/go-cmp/cmp"
+	appsv1 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/apiserver/pkg/features"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	appsv1ac "k8s.io/client-go/applyconfigurations/apps/v1"
+	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
+	metav1ac "k8s.io/client-go/applyconfigurations/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+
+	"k8s.io/component-base/version"
+	kubeapiservertesting "k8s.io/kubernetes/cmd/kube-apiserver/app/testing"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/test/integration/framework"
+	imageutils "k8s.io/kubernetes/test/utils/image"
 )
 
 func TestClient(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins", "ServiceAccount"}, framework.SharedEtcd())
+	defer result.TearDownFn()
 
-	client := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
-
-	ns := framework.CreateTestingNamespace("client", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	client := clientset.NewForConfigOrDie(result.ClientConfig)
 
 	info, err := client.Discovery().ServerVersion()
 	if err != nil {
@@ -60,7 +69,7 @@ func TestClient(t *testing.T) {
 		t.Errorf("expected %#v, got %#v", e, a)
 	}
 
-	pods, err := client.Pods(ns.Name).List(api.ListOptions{})
+	pods, err := client.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -69,13 +78,13 @@ func TestClient(t *testing.T) {
 	}
 
 	// get a validation error
-	pod := &api.Pod{
-		ObjectMeta: api.ObjectMeta{
+	pod := &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: "test",
-			Namespace:    ns.Name,
+			Namespace:    "default",
 		},
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
 					Name: "test",
 				},
@@ -83,14 +92,14 @@ func TestClient(t *testing.T) {
 		},
 	}
 
-	got, err := client.Pods(ns.Name).Create(pod)
+	got, err := client.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
 	if err == nil {
 		t.Fatalf("unexpected non-error: %v", got)
 	}
 
 	// get a created pod
 	pod.Spec.Containers[0].Image = "an-image"
-	got, err = client.Pods(ns.Name).Create(pod)
+	got, err = client.CoreV1().Pods("default").Create(context.TODO(), pod, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -99,7 +108,7 @@ func TestClient(t *testing.T) {
 	}
 
 	// pod is shown, but not scheduled
-	pods, err = client.Pods(ns.Name).List(api.ListOptions{})
+	pods, err = client.CoreV1().Pods("default").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -116,46 +125,43 @@ func TestClient(t *testing.T) {
 }
 
 func TestAtomicPut(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins", "ServiceAccount"}, framework.SharedEtcd())
+	defer result.TearDownFn()
 
-	c := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	c := clientset.NewForConfigOrDie(result.ClientConfig)
 
-	ns := framework.CreateTestingNamespace("atomic-put", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
-
-	rcBody := api.ReplicationController{
-		TypeMeta: unversioned.TypeMeta{
-			APIVersion: c.APIVersion().String(),
+	rcBody := v1.ReplicationController{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: c.CoreV1().RESTClient().APIVersion().String(),
 		},
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "atomicrc",
-			Namespace: ns.Name,
+			Namespace: "default",
 			Labels: map[string]string{
 				"name": "atomicrc",
 			},
 		},
-		Spec: api.ReplicationControllerSpec{
-			Replicas: 0,
+		Spec: v1.ReplicationControllerSpec{
+			Replicas: func(i int32) *int32 { return &i }(0),
 			Selector: map[string]string{
 				"foo": "bar",
 			},
-			Template: &api.PodTemplateSpec{
-				ObjectMeta: api.ObjectMeta{
+			Template: &v1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{
 						"foo": "bar",
 					},
 				},
-				Spec: api.PodSpec{
-					Containers: []api.Container{
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{
 						{Name: "name", Image: "image"},
 					},
 				},
 			},
 		},
 	}
-	rcs := c.ReplicationControllers(ns.Name)
-	rc, err := rcs.Create(&rcBody)
+	rcs := c.CoreV1().ReplicationControllers("default")
+	rc, err := rcs.Create(context.TODO(), &rcBody, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Failed creating atomicRC: %v", err)
 	}
@@ -172,7 +178,7 @@ func TestAtomicPut(t *testing.T) {
 		go func(l, v string) {
 			defer wg.Done()
 			for {
-				tmpRC, err := rcs.Get(rc.Name)
+				tmpRC, err := rcs.Get(context.TODO(), rc.Name, metav1.GetOptions{})
 				if err != nil {
 					t.Errorf("Error getting atomicRC: %v", err)
 					continue
@@ -184,7 +190,7 @@ func TestAtomicPut(t *testing.T) {
 					tmpRC.Spec.Selector[l] = v
 					tmpRC.Spec.Template.Labels[l] = v
 				}
-				tmpRC, err = rcs.Update(tmpRC)
+				_, err = rcs.Update(context.TODO(), tmpRC, metav1.UpdateOptions{})
 				if err != nil {
 					if apierrors.IsConflict(err) {
 						// This is what we expect.
@@ -198,7 +204,7 @@ func TestAtomicPut(t *testing.T) {
 		}(label, value)
 	}
 	wg.Wait()
-	rc, err = rcs.Get(rc.Name)
+	rc, err = rcs.Get(context.TODO(), rc.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("Failed getting atomicRC after writers are complete: %v", err)
 	}
@@ -208,54 +214,51 @@ func TestAtomicPut(t *testing.T) {
 }
 
 func TestPatch(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins", "ServiceAccount"}, framework.SharedEtcd())
+	defer result.TearDownFn()
 
-	c := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
-
-	ns := framework.CreateTestingNamespace("patch", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	c := clientset.NewForConfigOrDie(result.ClientConfig)
 
 	name := "patchpod"
 	resource := "pods"
-	podBody := api.Pod{
-		TypeMeta: unversioned.TypeMeta{
-			APIVersion: c.APIVersion().String(),
+	podBody := v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: c.CoreV1().RESTClient().APIVersion().String(),
 		},
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
-			Namespace: ns.Name,
+			Namespace: "default",
 			Labels:    map[string]string{},
 		},
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{Name: "name", Image: "image"},
 			},
 		},
 	}
-	pods := c.Pods(ns.Name)
-	pod, err := pods.Create(&podBody)
+	pods := c.CoreV1().Pods("default")
+	_, err := pods.Create(context.TODO(), &podBody, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Failed creating patchpods: %v", err)
 	}
 
-	patchBodies := map[unversioned.GroupVersion]map[api.PatchType]struct {
+	patchBodies := map[schema.GroupVersion]map[types.PatchType]struct {
 		AddLabelBody        []byte
 		RemoveLabelBody     []byte
 		RemoveAllLabelsBody []byte
 	}{
 		v1.SchemeGroupVersion: {
-			api.JSONPatchType: {
+			types.JSONPatchType: {
 				[]byte(`[{"op":"add","path":"/metadata/labels","value":{"foo":"bar","baz":"qux"}}]`),
 				[]byte(`[{"op":"remove","path":"/metadata/labels/foo"}]`),
 				[]byte(`[{"op":"remove","path":"/metadata/labels"}]`),
 			},
-			api.MergePatchType: {
+			types.MergePatchType: {
 				[]byte(`{"metadata":{"labels":{"foo":"bar","baz":"qux"}}}`),
 				[]byte(`{"metadata":{"labels":{"foo":null}}}`),
 				[]byte(`{"metadata":{"labels":null}}`),
 			},
-			api.StrategicMergePatchType: {
+			types.StrategicMergePatchType: {
 				[]byte(`{"metadata":{"labels":{"foo":"bar","baz":"qux"}}}`),
 				[]byte(`{"metadata":{"labels":{"foo":null}}}`),
 				[]byte(`{"metadata":{"labels":{"$patch":"replace"}}}`),
@@ -263,24 +266,37 @@ func TestPatch(t *testing.T) {
 		},
 	}
 
-	pb := patchBodies[c.APIVersion()]
+	pb := patchBodies[c.CoreV1().RESTClient().APIVersion()]
 
-	execPatch := func(pt api.PatchType, body []byte) error {
-		return c.Patch(pt).
+	execPatch := func(pt types.PatchType, body []byte) error {
+		result := c.CoreV1().RESTClient().Patch(pt).
 			Resource(resource).
-			Namespace(ns.Name).
+			Namespace("default").
 			Name(name).
 			Body(body).
-			Do().
-			Error()
+			Do(context.TODO())
+		if result.Error() != nil {
+			return result.Error()
+		}
+
+		// trying to chase flakes, this should give us resource versions of objects as we step through
+		jsonObj, err := result.Raw()
+		if err != nil {
+			t.Log(err)
+		} else {
+			t.Logf("%v", string(jsonObj))
+		}
+
+		return nil
 	}
+
 	for k, v := range pb {
 		// add label
 		err := execPatch(k, v.AddLabelBody)
 		if err != nil {
 			t.Fatalf("Failed updating patchpod with patch type %s: %v", k, err)
 		}
-		pod, err = pods.Get(name)
+		pod, err := pods.Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("Failed getting patchpod: %v", err)
 		}
@@ -293,7 +309,7 @@ func TestPatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed updating patchpod with patch type %s: %v", k, err)
 		}
-		pod, err = pods.Get(name)
+		pod, err = pods.Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("Failed getting patchpod: %v", err)
 		}
@@ -306,7 +322,7 @@ func TestPatch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed updating patchpod with patch type %s: %v", k, err)
 		}
-		pod, err = pods.Get(name)
+		pod, err = pods.Get(context.TODO(), name, metav1.GetOptions{})
 		if err != nil {
 			t.Fatalf("Failed getting patchpod: %v", err)
 		}
@@ -317,34 +333,31 @@ func TestPatch(t *testing.T) {
 }
 
 func TestPatchWithCreateOnUpdate(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	defer result.TearDownFn()
 
-	c := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	c := clientset.NewForConfigOrDie(result.ClientConfig)
 
-	ns := framework.CreateTestingNamespace("patch-with-create", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
-
-	endpointTemplate := &api.Endpoints{
-		ObjectMeta: api.ObjectMeta{
+	endpointTemplate := &v1.Endpoints{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "patchendpoint",
-			Namespace: ns.Name,
+			Namespace: "default",
 		},
-		Subsets: []api.EndpointSubset{
+		Subsets: []v1.EndpointSubset{
 			{
-				Addresses: []api.EndpointAddress{{IP: "1.2.3.4"}},
-				Ports:     []api.EndpointPort{{Port: 80, Protocol: api.ProtocolTCP}},
+				Addresses: []v1.EndpointAddress{{IP: "1.2.3.4"}},
+				Ports:     []v1.EndpointPort{{Port: 80, Protocol: v1.ProtocolTCP}},
 			},
 		},
 	}
 
 	patchEndpoint := func(json []byte) (runtime.Object, error) {
-		return c.Patch(api.MergePatchType).Resource("endpoints").Namespace(ns.Name).Name("patchendpoint").Body(json).Do().Get()
+		return c.CoreV1().RESTClient().Patch(types.MergePatchType).Resource("endpoints").Namespace("default").Name("patchendpoint").Body(json).Do(context.TODO()).Get()
 	}
 
 	// Make sure patch doesn't get to CreateOnUpdate
 	{
-		endpointJSON, err := runtime.Encode(api.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
+		endpointJSON, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
 		if err != nil {
 			t.Fatalf("Failed creating endpoint JSON: %v", err)
 		}
@@ -354,14 +367,14 @@ func TestPatchWithCreateOnUpdate(t *testing.T) {
 	}
 
 	// Create the endpoint (endpoints set AllowCreateOnUpdate=true) to get a UID and resource version
-	createdEndpoint, err := c.Endpoints(ns.Name).Update(endpointTemplate)
+	createdEndpoint, err := c.CoreV1().Endpoints("default").Update(context.TODO(), endpointTemplate, metav1.UpdateOptions{})
 	if err != nil {
 		t.Fatalf("Failed creating endpoint: %v", err)
 	}
 
 	// Make sure identity patch is accepted
 	{
-		endpointJSON, err := runtime.Encode(api.Codecs.LegacyCodec(v1.SchemeGroupVersion), createdEndpoint)
+		endpointJSON, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), createdEndpoint)
 		if err != nil {
 			t.Fatalf("Failed creating endpoint JSON: %v", err)
 		}
@@ -375,7 +388,7 @@ func TestPatchWithCreateOnUpdate(t *testing.T) {
 		endpointTemplate.Name = ""
 		endpointTemplate.UID = ""
 		endpointTemplate.ResourceVersion = "1"
-		endpointJSON, err := runtime.Encode(api.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
+		endpointJSON, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
 		if err != nil {
 			t.Fatalf("Failed creating endpoint JSON: %v", err)
 		}
@@ -389,7 +402,7 @@ func TestPatchWithCreateOnUpdate(t *testing.T) {
 		endpointTemplate.Name = ""
 		endpointTemplate.UID = "abc"
 		endpointTemplate.ResourceVersion = ""
-		endpointJSON, err := runtime.Encode(api.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
+		endpointJSON, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
 		if err != nil {
 			t.Fatalf("Failed creating endpoint JSON: %v", err)
 		}
@@ -403,7 +416,7 @@ func TestPatchWithCreateOnUpdate(t *testing.T) {
 		endpointTemplate.Name = "changedname"
 		endpointTemplate.UID = ""
 		endpointTemplate.ResourceVersion = ""
-		endpointJSON, err := runtime.Encode(api.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
+		endpointJSON, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
 		if err != nil {
 			t.Fatalf("Failed creating endpoint JSON: %v", err)
 		}
@@ -417,7 +430,7 @@ func TestPatchWithCreateOnUpdate(t *testing.T) {
 		endpointTemplate.Name = ""
 		endpointTemplate.UID = ""
 		endpointTemplate.ResourceVersion = ""
-		endpointJSON, err := runtime.Encode(api.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
+		endpointJSON, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), endpointTemplate)
 		if err != nil {
 			t.Fatalf("Failed creating endpoint JSON: %v", err)
 		}
@@ -428,17 +441,17 @@ func TestPatchWithCreateOnUpdate(t *testing.T) {
 }
 
 func TestAPIVersions(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	defer result.TearDownFn()
 
-	c := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	c := clientset.NewForConfigOrDie(result.ClientConfig)
 
-	clientVersion := c.APIVersion().String()
-	g, err := c.ServerGroups()
+	clientVersion := c.CoreV1().RESTClient().APIVersion().String()
+	g, err := c.Discovery().ServerGroups()
 	if err != nil {
 		t.Fatalf("Failed to get api versions: %v", err)
 	}
-	versions := unversioned.ExtractGroupVersions(g)
+	versions := metav1.ExtractGroupVersions(g)
 
 	// Verify that the server supports the API version used by the client.
 	for _, version := range versions {
@@ -450,23 +463,20 @@ func TestAPIVersions(t *testing.T) {
 }
 
 func TestSingleWatch(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	defer result.TearDownFn()
 
-	ns := framework.CreateTestingNamespace("single-watch", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	client := clientset.NewForConfigOrDie(result.ClientConfig)
 
-	client := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
-
-	mkEvent := func(i int) *api.Event {
+	mkEvent := func(i int) *v1.Event {
 		name := fmt.Sprintf("event-%v", i)
-		return &api.Event{
-			ObjectMeta: api.ObjectMeta{
-				Namespace: ns.Name,
+		return &v1.Event{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: "default",
 				Name:      name,
 			},
-			InvolvedObject: api.ObjectReference{
-				Namespace: ns.Name,
+			InvolvedObject: v1.ObjectReference{
+				Namespace: "default",
 				Name:      name,
 			},
 			Reason: fmt.Sprintf("event %v", i),
@@ -476,7 +486,7 @@ func TestSingleWatch(t *testing.T) {
 	rv1 := ""
 	for i := 0; i < 10; i++ {
 		event := mkEvent(i)
-		got, err := client.Events(ns.Name).Create(event)
+		got, err := client.CoreV1().Events("default").Create(context.TODO(), event, metav1.CreateOptions{})
 		if err != nil {
 			t.Fatalf("Failed creating event %#q: %v", event, err)
 		}
@@ -489,13 +499,15 @@ func TestSingleWatch(t *testing.T) {
 		t.Logf("Created event %#v", got.ObjectMeta)
 	}
 
-	w, err := client.Get().
-		Prefix("watch").
-		Namespace(ns.Name).
+	w, err := client.CoreV1().RESTClient().Get().
+		Namespace("default").
 		Resource("events").
-		Name("event-9").
-		Param("resourceVersion", rv1).
-		Watch()
+		VersionedParams(&metav1.ListOptions{
+			ResourceVersion: rv1,
+			Watch:           true,
+			FieldSelector:   fields.OneTermEqualSelector("metadata.name", "event-9").String(),
+		}, metav1.ParameterCodec).
+		Watch(context.TODO())
 
 	if err != nil {
 		t.Fatalf("Failed watch: %v", err)
@@ -517,7 +529,7 @@ func TestSingleWatch(t *testing.T) {
 			t.Errorf("Wanted %v, got %v", e, a)
 		}
 		switch o := got.Object.(type) {
-		case *api.Event:
+		case *v1.Event:
 			if e, a := "event-9", o.Name; e != a {
 				t.Errorf("Wanted %v, got %v", e, a)
 			}
@@ -529,30 +541,27 @@ func TestSingleWatch(t *testing.T) {
 
 func TestMultiWatch(t *testing.T) {
 	// Disable this test as long as it demonstrates a problem.
-	// TODO: Reenable this test when we get #6059 resolved.
-	return
+	// TODO: Re-enable this test when we get #6059 resolved.
+	t.Skip()
 
 	const watcherCount = 50
 	rt.GOMAXPROCS(watcherCount)
 
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, nil, framework.SharedEtcd())
+	defer result.TearDownFn()
 
-	ns := framework.CreateTestingNamespace("multi-watch", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	client := clientset.NewForConfigOrDie(result.ClientConfig)
 
-	client := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
-
-	dummyEvent := func(i int) *api.Event {
+	dummyEvent := func(i int) *v1.Event {
 		name := fmt.Sprintf("unrelated-%v", i)
-		return &api.Event{
-			ObjectMeta: api.ObjectMeta{
+		return &v1.Event{
+			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("%v.%x", name, time.Now().UnixNano()),
-				Namespace: ns.Name,
+				Namespace: "default",
 			},
-			InvolvedObject: api.ObjectReference{
+			InvolvedObject: v1.ObjectReference{
 				Name:      name,
-				Namespace: ns.Name,
+				Namespace: "default",
 			},
 			Reason: fmt.Sprintf("unrelated change %v", i),
 		}
@@ -570,28 +579,28 @@ func TestMultiWatch(t *testing.T) {
 	for i := 0; i < watcherCount; i++ {
 		watchesStarted.Add(1)
 		name := fmt.Sprintf("multi-watch-%v", i)
-		got, err := client.Pods(ns.Name).Create(&api.Pod{
-			ObjectMeta: api.ObjectMeta{
+		got, err := client.CoreV1().Pods("default").Create(context.TODO(), &v1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
 				Name:   name,
 				Labels: labels.Set{"watchlabel": name},
 			},
-			Spec: api.PodSpec{
-				Containers: []api.Container{{
+			Spec: v1.PodSpec{
+				Containers: []v1.Container{{
 					Name:  "pause",
-					Image: e2e.GetPauseImageName(client),
+					Image: imageutils.GetPauseImageName(),
 				}},
 			},
-		})
+		}, metav1.CreateOptions{})
 
 		if err != nil {
 			t.Fatalf("Couldn't make %v: %v", name, err)
 		}
 		go func(name, rv string) {
-			options := api.ListOptions{
-				LabelSelector:   labels.Set{"watchlabel": name}.AsSelector(),
+			options := metav1.ListOptions{
+				LabelSelector:   labels.Set{"watchlabel": name}.AsSelector().String(),
 				ResourceVersion: rv,
 			}
-			w, err := client.Pods(ns.Name).Watch(options)
+			w, err := client.CoreV1().Pods("default").Watch(context.TODO(), options)
 			if err != nil {
 				panic(fmt.Sprintf("watch error for %v: %v", name, err))
 			}
@@ -640,7 +649,7 @@ func TestMultiWatch(t *testing.T) {
 					if !ok {
 						return
 					}
-					if _, err := client.Events(ns.Name).Create(dummyEvent(i)); err != nil {
+					if _, err := client.CoreV1().Events("default").Create(context.TODO(), dummyEvent(i), metav1.CreateOptions{}); err != nil {
 						panic(fmt.Sprintf("couldn't make an event: %v", err))
 					}
 					changeMade <- i
@@ -677,17 +686,17 @@ func TestMultiWatch(t *testing.T) {
 						return
 					}
 					name := fmt.Sprintf("unrelated-%v", i)
-					_, err := client.Pods(ns.Name).Create(&api.Pod{
-						ObjectMeta: api.ObjectMeta{
+					_, err := client.CoreV1().Pods("default").Create(context.TODO(), &v1.Pod{
+						ObjectMeta: metav1.ObjectMeta{
 							Name: name,
 						},
-						Spec: api.PodSpec{
-							Containers: []api.Container{{
+						Spec: v1.PodSpec{
+							Containers: []v1.Container{{
 								Name:  "nothing",
-								Image: e2e.GetPauseImageName(client),
+								Image: imageutils.GetPauseImageName(),
 							}},
 						},
-					})
+					}, metav1.CreateOptions{})
 
 					if err != nil {
 						panic(fmt.Sprintf("couldn't make unrelated pod: %v", err))
@@ -711,13 +720,13 @@ func TestMultiWatch(t *testing.T) {
 	for i := 0; i < watcherCount; i++ {
 		go func(i int) {
 			name := fmt.Sprintf("multi-watch-%v", i)
-			pod, err := client.Pods(ns.Name).Get(name)
+			pod, err := client.CoreV1().Pods("default").Get(context.TODO(), name, metav1.GetOptions{})
 			if err != nil {
 				panic(fmt.Sprintf("Couldn't get %v: %v", name, err))
 			}
-			pod.Spec.Containers[0].Image = e2e.GetPauseImageName(client)
+			pod.Spec.Containers[0].Image = imageutils.GetPauseImageName()
 			sentTimes <- timePair{time.Now(), name}
-			if _, err := client.Pods(ns.Name).Update(pod); err != nil {
+			if _, err := client.CoreV1().Pods("default").Update(context.TODO(), pod, metav1.UpdateOptions{}); err != nil {
 				panic(fmt.Sprintf("Couldn't make %v: %v", name, err))
 			}
 		}(i)
@@ -740,35 +749,35 @@ func TestMultiWatch(t *testing.T) {
 	t.Errorf("durations: %v", dur)
 }
 
-func runSelfLinkTestOnNamespace(t *testing.T, c *client.Client, namespace string) {
-	podBody := api.Pod{
-		ObjectMeta: api.ObjectMeta{
+func runSelfLinkTestOnNamespace(t *testing.T, c clientset.Interface, namespace string) {
+	podBody := v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "selflinktest",
 			Namespace: namespace,
 			Labels: map[string]string{
 				"name": "selflinktest",
 			},
 		},
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{Name: "name", Image: "image"},
 			},
 		},
 	}
-	pod, err := c.Pods(namespace).Create(&podBody)
+	pod, err := c.CoreV1().Pods(namespace).Create(context.TODO(), &podBody, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("Failed creating selflinktest pod: %v", err)
 	}
-	if err = c.Get().RequestURI(pod.SelfLink).Do().Into(pod); err != nil {
+	if err = c.CoreV1().RESTClient().Get().RequestURI(pod.SelfLink).Do(context.TODO()).Into(pod); err != nil {
 		t.Errorf("Failed listing pod with supplied self link '%v': %v", pod.SelfLink, err)
 	}
 
-	podList, err := c.Pods(namespace).List(api.ListOptions{})
+	podList, err := c.CoreV1().Pods(namespace).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Errorf("Failed listing pods: %v", err)
 	}
 
-	if err = c.Get().RequestURI(podList.SelfLink).Do().Into(podList); err != nil {
+	if err = c.CoreV1().RESTClient().Get().RequestURI(podList.SelfLink).Do(context.TODO()).Into(podList); err != nil {
 		t.Errorf("Failed listing pods with supplied self link '%v': %v", podList.SelfLink, err)
 	}
 
@@ -779,7 +788,7 @@ func runSelfLinkTestOnNamespace(t *testing.T, c *client.Client, namespace string
 			continue
 		}
 		found = true
-		err = c.Get().RequestURI(item.SelfLink).Do().Into(pod)
+		err = c.CoreV1().RESTClient().Get().RequestURI(item.SelfLink).Do(context.TODO()).Into(pod)
 		if err != nil {
 			t.Errorf("Failed listing pod with supplied self link '%v': %v", item.SelfLink, err)
 		}
@@ -791,13 +800,388 @@ func runSelfLinkTestOnNamespace(t *testing.T, c *client.Client, namespace string
 }
 
 func TestSelfLinkOnNamespace(t *testing.T) {
-	_, s := framework.RunAMaster(nil)
-	defer s.Close()
+	defer featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.RemoveSelfLink, false)()
 
-	ns := framework.CreateTestingNamespace("selflink", s, t)
-	defer framework.DeleteTestingNamespace(ns, s, t)
+	result := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins", "ServiceAccount"}, framework.SharedEtcd())
+	defer result.TearDownFn()
 
-	c := client.NewOrDie(&restclient.Config{Host: s.URL, ContentConfig: restclient.ContentConfig{GroupVersion: testapi.Default.GroupVersion()}})
+	c := clientset.NewForConfigOrDie(result.ClientConfig)
 
-	runSelfLinkTestOnNamespace(t, c, ns.Name)
+	runSelfLinkTestOnNamespace(t, c, "default")
+}
+
+func TestApplyWithApplyConfiguration(t *testing.T) {
+	deployment := appsv1ac.Deployment("nginx-deployment-3", "default").
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithSelector(metav1ac.LabelSelector().
+				WithMatchLabels(map[string]string{"app": "nginx"}),
+			).
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithLabels(map[string]string{"app": "nginx"}).
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(corev1ac.Container().
+						WithName("nginx").
+						WithImage("nginx:1.14.2").
+						WithStdin(true).
+						WithPorts(corev1ac.ContainerPort().
+							WithContainerPort(8080).
+							WithProtocol(v1.ProtocolTCP),
+						).
+						WithResources(corev1ac.ResourceRequirements().
+							WithLimits(v1.ResourceList{
+								v1.ResourceCPU:    resource.MustParse("4"),
+								v1.ResourceMemory: resource.MustParse("32Gi"),
+							}),
+						),
+					),
+				),
+			),
+		)
+	testServer := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins", "ServiceAccount"}, framework.SharedEtcd())
+	defer testServer.TearDownFn()
+
+	c := clientset.NewForConfigOrDie(testServer.ClientConfig)
+
+	// Test apply to spec
+	obj, err := c.AppsV1().Deployments("default").Apply(context.TODO(), deployment, metav1.ApplyOptions{FieldManager: "test-mgr", Force: true})
+	if err != nil {
+		t.Fatalf("unexpected error when applying manifest for Deployment: %v", err)
+	}
+	if obj.Spec.Template.Spec.Containers[0].Image != "nginx:1.14.2" {
+		t.Errorf("expected image %s but got %s", "nginx:1.14.2", obj.Spec.Template.Spec.Containers[0].Image)
+	}
+	cpu := obj.Spec.Template.Spec.Containers[0].Resources.Limits[v1.ResourceCPU]
+	if cpu.Value() != int64(4) {
+		t.Errorf("expected resourceCPU limit %d but got %d", 4, cpu.Value())
+	}
+
+	// Test apply to status
+	statusApply := appsv1ac.Deployment("nginx-deployment-3", "default").
+		WithStatus(appsv1ac.DeploymentStatus().
+			WithConditions(
+				appsv1ac.DeploymentCondition().
+					WithType(appsv1.DeploymentReplicaFailure).
+					WithStatus(v1.ConditionUnknown).
+					WithLastTransitionTime(metav1.Now()).
+					WithLastUpdateTime(metav1.Now()).
+					WithMessage("apply status test").
+					WithReason("TestApplyWithApplyConfiguration"),
+			),
+		)
+	obj, err = c.AppsV1().Deployments("default").ApplyStatus(context.TODO(), statusApply, metav1.ApplyOptions{FieldManager: "test-mgr", Force: true})
+	if err != nil {
+		t.Fatalf("unexpected error when applying manifest for Deployment: %v", err)
+	}
+	var found bool
+	for _, c := range obj.Status.Conditions {
+		if c.Type == appsv1.DeploymentReplicaFailure && c.Status == v1.ConditionUnknown &&
+			c.Message == "apply status test" && c.Reason == "TestApplyWithApplyConfiguration" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("expected status to contain DeploymentReplicaFailure condition set by apply")
+	}
+}
+
+func TestExtractModifyApply(t *testing.T) {
+	testCases := []struct {
+		name string
+		// modifyFunc modifies deployApply, defined below, after it is applied and "extracted"
+		// apply is skipped if this func is nil
+		modifyFunc       func(apply *appsv1ac.DeploymentApplyConfiguration)
+		modifyStatusFunc func(apply *appsv1ac.DeploymentApplyConfiguration) // same but for status
+		// verifyAppliedFunc verifies the results of applying the applied
+		// configuration after modifyFunc modifies it. Only called if modifyFunc is provided.
+		verifyAppliedFunc       func(applied *appsv1ac.DeploymentApplyConfiguration)
+		verifyStatusAppliedFunc func(applied *appsv1ac.DeploymentApplyConfiguration) // same but for status
+	}{
+		{
+			// With<fieldname>() on a scalar field replaces it with the given value
+			name: "modify-scalar",
+			modifyFunc: func(apply *appsv1ac.DeploymentApplyConfiguration) {
+				apply.Spec.WithReplicas(2)
+			},
+			verifyAppliedFunc: func(applied *appsv1ac.DeploymentApplyConfiguration) {
+				if *applied.Spec.Replicas != 2 {
+					t.Errorf("Expected 2 replicas but got: %d", *applied.Spec.Replicas)
+				}
+			},
+		},
+		{
+			// With<fieldname>() on a non-empty struct field replaces the entire struct
+			name: "modify-struct",
+			modifyFunc: func(apply *appsv1ac.DeploymentApplyConfiguration) {
+				apply.Spec.Template.WithSpec(corev1ac.PodSpec(). // replace the Spec of the existing Template
+											WithContainers(
+						corev1ac.Container().
+							WithName("modify-struct").
+							WithImage("nginx:1.14.3"),
+					),
+				)
+			},
+			verifyAppliedFunc: func(applied *appsv1ac.DeploymentApplyConfiguration) {
+				containers := applied.Spec.Template.Spec.Containers
+				if len(containers) != 1 {
+					t.Errorf("Expected 1 container but got %d", len(containers))
+				}
+				if *containers[0].Name != "modify-struct" {
+					t.Errorf("Expected container name modify-struct but got: %s", *containers[0].Name)
+				}
+			},
+		},
+		{
+			// With<fieldname>() on a non-empty map field puts all the given entries into the existing map
+			name: "modify-map",
+			modifyFunc: func(apply *appsv1ac.DeploymentApplyConfiguration) {
+				apply.WithLabels(map[string]string{"label2": "value2"})
+			},
+			verifyAppliedFunc: func(applied *appsv1ac.DeploymentApplyConfiguration) {
+				labels := applied.Labels
+				if len(labels) != 2 {
+					t.Errorf("Expected 2 label but got %d", len(labels))
+				}
+				if labels["label2"] != "value2" {
+					t.Errorf("Expected container name value2 but got: %s", labels["label2"])
+				}
+			},
+		},
+		{
+			// With<fieldname>() on a non-empty slice field appends all the given items to the existing slice
+			name: "modify-slice",
+			modifyFunc: func(apply *appsv1ac.DeploymentApplyConfiguration) {
+				apply.Spec.Template.Spec.WithContainers(corev1ac.Container().
+					WithName("modify-slice").
+					WithImage("nginx:1.14.2"),
+				)
+			},
+			verifyAppliedFunc: func(applied *appsv1ac.DeploymentApplyConfiguration) {
+				containers := applied.Spec.Template.Spec.Containers
+				if len(containers) != 2 {
+					t.Errorf("Expected 2 containers but got %d", len(containers))
+				}
+				if *containers[0].Name != "initial-container" {
+					t.Errorf("Expected container name initial-container but got: %s", *containers[0].Name)
+				}
+				if *containers[1].Name != "modify-slice" {
+					t.Errorf("Expected container name modify-slice but got: %s", *containers[1].Name)
+				}
+			},
+		},
+		{
+			// Append a condition to the status if the object
+			name: "modify-status-conditions",
+			modifyStatusFunc: func(apply *appsv1ac.DeploymentApplyConfiguration) {
+				apply.WithStatus(appsv1ac.DeploymentStatus().
+					WithConditions(appsv1ac.DeploymentCondition().
+						WithType(appsv1.DeploymentProgressing).
+						WithStatus(v1.ConditionUnknown).
+						WithLastTransitionTime(metav1.Now()).
+						WithLastUpdateTime(metav1.Now()).
+						WithMessage("progressing").
+						WithReason("TestExtractModifyApply_Status"),
+					),
+				)
+			},
+			verifyStatusAppliedFunc: func(applied *appsv1ac.DeploymentApplyConfiguration) {
+				conditions := applied.Status.Conditions
+				if len(conditions) != 1 {
+					t.Errorf("Expected 1 conditions but got %d", len(conditions))
+				}
+				if *conditions[0].Type != appsv1.DeploymentProgressing {
+					t.Errorf("Expected condition name DeploymentProgressing but got: %s", *conditions[0].Type)
+				}
+			},
+		},
+	}
+
+	testServer := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins", "ServiceAccount"}, framework.SharedEtcd())
+	defer testServer.TearDownFn()
+	c := clientset.NewForConfigOrDie(testServer.ClientConfig)
+	deploymentClient := c.AppsV1().Deployments("default")
+	fieldMgr := "test-mgr"
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Applied at the started of each test
+			deployApply := appsv1ac.Deployment(tc.name, "default").
+				WithLabels(map[string]string{"label1": "value1"}).
+				WithSpec(appsv1ac.DeploymentSpec().
+					WithSelector(metav1ac.LabelSelector().
+						WithMatchLabels(map[string]string{"app": tc.name}),
+					).
+					WithTemplate(corev1ac.PodTemplateSpec().
+						WithLabels(map[string]string{"app": tc.name}).
+						WithSpec(corev1ac.PodSpec().
+							WithContainers(
+								corev1ac.Container().
+									WithName("initial-container").
+									WithImage("nginx:1.14.2"),
+							),
+						),
+					),
+				)
+			actual, err := deploymentClient.Apply(context.TODO(), deployApply, metav1.ApplyOptions{FieldManager: fieldMgr})
+			if err != nil {
+				t.Fatalf("Failed to apply: %v", err)
+			}
+			if tc.modifyFunc != nil {
+				extractedDeployment, err := appsv1ac.ExtractDeployment(actual, fieldMgr)
+				if err != nil {
+					t.Fatalf("Failed to extract: %v", err)
+				}
+				tc.modifyFunc(extractedDeployment)
+				result, err := deploymentClient.Apply(context.TODO(), extractedDeployment, metav1.ApplyOptions{FieldManager: fieldMgr})
+				if err != nil {
+					t.Fatalf("Failed to apply extracted apply configuration: %v", err)
+				}
+				extractedResult, err := appsv1ac.ExtractDeployment(result, fieldMgr)
+				if err != nil {
+					t.Fatalf("Failed to extract: %v", err)
+				}
+				if tc.verifyAppliedFunc != nil {
+					tc.verifyAppliedFunc(extractedResult)
+				}
+			}
+
+			if tc.modifyStatusFunc != nil {
+				extractedDeployment, err := appsv1ac.ExtractDeploymentStatus(actual, fieldMgr)
+				if err != nil {
+					t.Fatalf("Failed to extract: %v", err)
+				}
+				tc.modifyStatusFunc(extractedDeployment)
+				result, err := deploymentClient.ApplyStatus(context.TODO(), extractedDeployment, metav1.ApplyOptions{FieldManager: fieldMgr})
+				if err != nil {
+					t.Fatalf("Failed to apply extracted apply configuration to status: %v", err)
+				}
+				extractedResult, err := appsv1ac.ExtractDeploymentStatus(result, fieldMgr)
+				if err != nil {
+					t.Fatalf("Failed to extract: %v", err)
+				}
+				if tc.verifyStatusAppliedFunc != nil {
+					tc.verifyStatusAppliedFunc(extractedResult)
+				}
+			}
+		})
+	}
+}
+
+func TestExtractModifyApply_ForceOwnership(t *testing.T) {
+	testServer := kubeapiservertesting.StartTestServerOrDie(t, nil, []string{"--disable-admission-plugins", "ServiceAccount"}, framework.SharedEtcd())
+	defer testServer.TearDownFn()
+	c := clientset.NewForConfigOrDie(testServer.ClientConfig)
+	deploymentClient := c.AppsV1().Deployments("default")
+
+	// apply an initial state with one field manager
+	createApply := appsv1ac.Deployment("nginx-apply", "default").
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithSelector(metav1ac.LabelSelector().
+				WithMatchLabels(map[string]string{"app": "nginx"}),
+			).
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithLabels(map[string]string{"app": "nginx"}).
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(
+						corev1ac.Container().
+							WithName("nginx").
+							WithImage("nginx:1.14.2").
+							WithWorkingDir("/tmp/v1"),
+					),
+				),
+			),
+		)
+
+	_, err := deploymentClient.Apply(context.TODO(), createApply, metav1.ApplyOptions{FieldManager: "create-mgr", Force: true})
+	if err != nil {
+		t.Fatalf("Error creating createApply: %v", err)
+	}
+
+	// apply some non-overlapping fields with another field manager
+	sidecarApply := appsv1ac.Deployment("nginx-apply", "default").
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(
+						corev1ac.Container().
+							WithName("sidecar").
+							WithImage("nginx:1.14.2"),
+					),
+				),
+			),
+		)
+
+	applied, err := deploymentClient.Apply(context.TODO(), sidecarApply, metav1.ApplyOptions{FieldManager: "sidecar-mgr", Force: true})
+	if err != nil {
+		t.Fatalf("Error applying createApply: %v", err)
+	}
+	sidecarExtracted, err := appsv1ac.ExtractDeployment(applied, "sidecar-mgr")
+	if err != nil {
+		t.Fatalf("Error extracting createApply apply configuration: %v", err)
+	}
+	if !equality.Semantic.DeepEqual(sidecarApply, sidecarExtracted) {
+		t.Errorf("Expected sidecarExtracted apply configuration to match original, but got:\n%s\n", cmp.Diff(sidecarApply, sidecarExtracted))
+	}
+
+	// modify the extracted apply configuration that was just applied and add some fields that overlap
+	// with the fields owned by the other field manager to force ownership of them
+	sidecarExtracted.Spec.Template.Spec.Containers[0].WithImage("nginx:1.14.3")
+	sidecarExtracted.Spec.Template.Spec.WithContainers(corev1ac.Container().
+		WithName("nginx").
+		WithWorkingDir("/tmp/v2"),
+	)
+	reapplied, err := deploymentClient.Apply(context.TODO(), sidecarExtracted, metav1.ApplyOptions{FieldManager: "sidecar-mgr", Force: true})
+	if err != nil {
+		t.Fatalf("Unexpected error when applying manifest for Deployment: %v", err)
+	}
+
+	// extract apply configurations for both field managers and check that they are what we expect
+	reappliedExtracted, err := appsv1ac.ExtractDeployment(reapplied, "sidecar-mgr")
+	if err != nil {
+		t.Fatalf("Error extracting sidecarExtracted apply configuration: %v", err)
+	}
+
+	expectedReappliedExtracted := appsv1ac.Deployment("nginx-apply", "default").
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(
+						corev1ac.Container().
+							WithName("nginx").
+							WithWorkingDir("/tmp/v2"),
+						corev1ac.Container().
+							WithName("sidecar").
+							WithImage("nginx:1.14.3"),
+					),
+				),
+			),
+		)
+	if !equality.Semantic.DeepEqual(expectedReappliedExtracted, reappliedExtracted) {
+		t.Errorf("Reapplied apply configuration did not match expected, got:\n%s\n", cmp.Diff(expectedReappliedExtracted, reappliedExtracted))
+	}
+
+	createMgrExtracted, err := appsv1ac.ExtractDeployment(reapplied, "create-mgr")
+	if err != nil {
+		t.Fatalf("Error extracting createApply apply configuration: %v", err)
+	}
+
+	expectedCreateExtracted := appsv1ac.Deployment("nginx-apply", "default").
+		WithSpec(appsv1ac.DeploymentSpec().
+			WithSelector(metav1ac.LabelSelector().
+				WithMatchLabels(map[string]string{"app": "nginx"}),
+			).
+			WithTemplate(corev1ac.PodTemplateSpec().
+				WithLabels(map[string]string{"app": "nginx"}).
+				WithSpec(corev1ac.PodSpec().
+					WithContainers(
+						corev1ac.Container().
+							WithName("nginx").
+							WithImage("nginx:1.14.2"),
+					),
+				),
+			),
+		)
+	if !equality.Semantic.DeepEqual(expectedCreateExtracted, createMgrExtracted) {
+		t.Errorf("createMgrExtracted apply configuration did not match expected, got:\n%s\n", cmp.Diff(expectedCreateExtracted, createMgrExtracted))
+	}
 }

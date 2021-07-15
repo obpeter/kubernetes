@@ -1,3 +1,5 @@
+// +build !providerless
+
 /*
 Copyright 2016 The Kubernetes Authors.
 
@@ -18,19 +20,27 @@ package vsphere_volume
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/cloudprovider/providers/vsphere"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
+	"k8s.io/legacy-cloud-providers/vsphere/vclib"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/klog/v2"
+)
+
+var (
+	// diskNameErr is the error when disk name is wrong.
+	diskNameErr = errors.New("wrong diskName")
+	// nodeNameErr is the error when node name is wrong.
+	nodeNameErr = errors.New("wrong nodeName")
 )
 
 func TestGetDeviceName_Volume(t *testing.T) {
-	plugin := newPlugin()
+	plugin := newPlugin(t)
 	volPath := "[local] volumes/test"
 	spec := createVolSpec(volPath)
 
@@ -44,7 +54,7 @@ func TestGetDeviceName_Volume(t *testing.T) {
 }
 
 func TestGetDeviceName_PersistentVolume(t *testing.T) {
-	plugin := newPlugin()
+	plugin := newPlugin(t)
 	volPath := "[local] volumes/test"
 	spec := createPVSpec(volPath)
 
@@ -78,9 +88,9 @@ func TestAttachDetach(t *testing.T) {
 	diskName := "[local] volumes/test"
 	nodeName := types.NodeName("host")
 	spec := createVolSpec(diskName)
-	attachError := errors.New("Fake attach error")
-	detachError := errors.New("Fake detach error")
-	diskCheckError := errors.New("Fake DiskIsAttached error")
+	attachError := errors.New("fake attach error")
+	detachError := errors.New("fake detach error")
+	diskCheckError := errors.New("fake DiskIsAttached error")
 	tests := []testcase{
 		// Successful Attach call
 		{
@@ -164,8 +174,8 @@ func TestAttachDetach(t *testing.T) {
 
 // newPlugin creates a new vsphereVolumePlugin with fake cloud, NewAttacher
 // and NewDetacher won't work.
-func newPlugin() *vsphereVolumePlugin {
-	host := volumetest.NewFakeVolumeHost("/tmp", nil, nil, "")
+func newPlugin(t *testing.T) *vsphereVolumePlugin {
+	host := volumetest.NewFakeVolumeHost(t, "/tmp", nil, nil)
 	plugins := ProbeVolumePlugins()
 	plugin := plugins[0]
 	plugin.Init(host)
@@ -187,9 +197,9 @@ func newDetacher(testcase *testcase) *vsphereVMDKDetacher {
 
 func createVolSpec(name string) *volume.Spec {
 	return &volume.Spec{
-		Volume: &api.Volume{
-			VolumeSource: api.VolumeSource{
-				VsphereVolume: &api.VsphereVirtualDiskVolumeSource{
+		Volume: &v1.Volume{
+			VolumeSource: v1.VolumeSource{
+				VsphereVolume: &v1.VsphereVirtualDiskVolumeSource{
 					VolumePath: name,
 				},
 			},
@@ -199,10 +209,10 @@ func createVolSpec(name string) *volume.Spec {
 
 func createPVSpec(name string) *volume.Spec {
 	return &volume.Spec{
-		PersistentVolume: &api.PersistentVolume{
-			Spec: api.PersistentVolumeSpec{
-				PersistentVolumeSource: api.PersistentVolumeSource{
-					VsphereVolume: &api.VsphereVirtualDiskVolumeSource{
+		PersistentVolume: &v1.PersistentVolume{
+			Spec: v1.PersistentVolumeSpec{
+				PersistentVolumeSource: v1.PersistentVolumeSource{
+					VsphereVolume: &v1.VsphereVirtualDiskVolumeSource{
 						VolumePath: name,
 					},
 				},
@@ -233,29 +243,29 @@ type diskIsAttachedCall struct {
 	ret        error
 }
 
-func (testcase *testcase) AttachDisk(diskName string, nodeName types.NodeName) (string, string, error) {
+func (testcase *testcase) AttachDisk(diskName string, storagePolicyName string, nodeName types.NodeName) (string, error) {
 	expected := &testcase.attach
 
 	if expected.diskName == "" && expected.nodeName == "" {
 		// testcase.attach looks uninitialized, test did not expect to call
 		// AttachDisk
 		testcase.t.Errorf("Unexpected AttachDisk call!")
-		return "", "", errors.New("Unexpected AttachDisk call!")
+		return "", errors.New("unexpected AttachDisk call")
 	}
 
 	if expected.diskName != diskName {
 		testcase.t.Errorf("Unexpected AttachDisk call: expected diskName %s, got %s", expected.diskName, diskName)
-		return "", "", errors.New("Unexpected AttachDisk call: wrong diskName")
+		return "", fmt.Errorf(`unexpected AttachDisk call: %w`, diskNameErr)
 	}
 
 	if expected.nodeName != nodeName {
 		testcase.t.Errorf("Unexpected AttachDisk call: expected nodeName %s, got %s", expected.nodeName, nodeName)
-		return "", "", errors.New("Unexpected AttachDisk call: wrong nodeName")
+		return "", fmt.Errorf(`unexpected AttachDisk call: %w`, nodeNameErr)
 	}
 
-	glog.V(4).Infof("AttachDisk call: %s, %s, returning %q, %v", diskName, nodeName, expected.retDeviceUUID, expected.ret)
+	klog.V(4).Infof("AttachDisk call: %s, %s, returning %q, %v", diskName, nodeName, expected.retDeviceUUID, expected.ret)
 
-	return "", expected.retDeviceUUID, expected.ret
+	return expected.retDeviceUUID, expected.ret
 }
 
 func (testcase *testcase) DetachDisk(diskName string, nodeName types.NodeName) error {
@@ -265,53 +275,57 @@ func (testcase *testcase) DetachDisk(diskName string, nodeName types.NodeName) e
 		// testcase.detach looks uninitialized, test did not expect to call
 		// DetachDisk
 		testcase.t.Errorf("Unexpected DetachDisk call!")
-		return errors.New("Unexpected DetachDisk call!")
+		return errors.New("unexpected DetachDisk call")
 	}
 
 	if expected.diskName != diskName {
 		testcase.t.Errorf("Unexpected DetachDisk call: expected diskName %s, got %s", expected.diskName, diskName)
-		return errors.New("Unexpected DetachDisk call: wrong diskName")
+		return fmt.Errorf(`unexpected DetachDisk call: %w`, diskNameErr)
 	}
 
 	if expected.nodeName != nodeName {
 		testcase.t.Errorf("Unexpected DetachDisk call: expected nodeName %s, got %s", expected.nodeName, nodeName)
-		return errors.New("Unexpected DetachDisk call: wrong nodeName")
+		return fmt.Errorf(`unexpected DetachDisk call: %w`, nodeNameErr)
 	}
 
-	glog.V(4).Infof("DetachDisk call: %s, %s, returning %v", diskName, nodeName, expected.ret)
+	klog.V(4).Infof("DetachDisk call: %s, %s, returning %v", diskName, nodeName, expected.ret)
 
 	return expected.ret
 }
 
-func (testcase *testcase) DiskIsAttached(diskName string, nodeName types.NodeName) (bool, error) {
+func (testcase *testcase) DiskIsAttached(diskName string, nodeName types.NodeName) (bool, string, error) {
 	expected := &testcase.diskIsAttached
 
 	if expected.diskName == "" && expected.nodeName == "" {
 		// testcase.diskIsAttached looks uninitialized, test did not expect to
 		// call DiskIsAttached
 		testcase.t.Errorf("Unexpected DiskIsAttached call!")
-		return false, errors.New("Unexpected DiskIsAttached call!")
+		return false, diskName, errors.New("unexpected DiskIsAttached call")
 	}
 
 	if expected.diskName != diskName {
 		testcase.t.Errorf("Unexpected DiskIsAttached call: expected diskName %s, got %s", expected.diskName, diskName)
-		return false, errors.New("Unexpected DiskIsAttached call: wrong diskName")
+		return false, diskName, fmt.Errorf(`unexpected DiskIsAttached call: %w`, diskNameErr)
 	}
 
 	if expected.nodeName != nodeName {
 		testcase.t.Errorf("Unexpected DiskIsAttached call: expected nodeName %s, got %s", expected.nodeName, nodeName)
-		return false, errors.New("Unexpected DiskIsAttached call: wrong nodeName")
+		return false, diskName, fmt.Errorf(`unexpected DiskIsAttached call: %w`, nodeNameErr)
 	}
 
-	glog.V(4).Infof("DiskIsAttached call: %s, %s, returning %v, %v", diskName, nodeName, expected.isAttached, expected.ret)
+	klog.V(4).Infof("DiskIsAttached call: %s, %s, returning %v, %v", diskName, nodeName, expected.isAttached, expected.ret)
 
-	return expected.isAttached, expected.ret
+	return expected.isAttached, diskName, expected.ret
 }
 
-func (testcase *testcase) CreateVolume(volumeOptions *vsphere.VolumeOptions) (volumePath string, err error) {
-	return "", errors.New("Not implemented")
+func (testcase *testcase) DisksAreAttached(nodeVolumes map[types.NodeName][]string) (map[types.NodeName]map[string]bool, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (testcase *testcase) CreateVolume(volumeOptions *vclib.VolumeOptions) (volumePath string, err error) {
+	return "", errors.New("not implemented")
 }
 
 func (testcase *testcase) DeleteVolume(vmDiskPath string) error {
-	return errors.New("Not implemented")
+	return errors.New("not implemented")
 }

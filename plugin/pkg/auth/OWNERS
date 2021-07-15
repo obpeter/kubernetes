@@ -1,3 +1,8 @@
-assignees:
-  - erictune
-  - liggitt
+# See the OWNERS docs at https://go.k8s.io/owners
+
+approvers:
+- sig-auth-api-approvers
+reviewers:
+- sig-auth-api-reviewers
+labels:
+- sig/auth

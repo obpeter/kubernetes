@@ -17,9 +17,8 @@ limitations under the License.
 package stats
 
 import (
+	"k8s.io/client-go/tools/record"
 	"time"
-
-	"k8s.io/kubernetes/pkg/kubelet/container"
 )
 
 // ResourceAnalyzer provides statistics on node resource consumption
@@ -39,9 +38,9 @@ type resourceAnalyzer struct {
 var _ ResourceAnalyzer = &resourceAnalyzer{}
 
 // NewResourceAnalyzer returns a new ResourceAnalyzer
-func NewResourceAnalyzer(statsProvider StatsProvider, calVolumeFrequency time.Duration, runtime container.Runtime) ResourceAnalyzer {
-	fsAnalyzer := newFsResourceAnalyzer(statsProvider, calVolumeFrequency)
-	summaryProvider := NewSummaryProvider(statsProvider, fsAnalyzer, runtime)
+func NewResourceAnalyzer(statsProvider Provider, calVolumeFrequency time.Duration, eventRecorder record.EventRecorder) ResourceAnalyzer {
+	fsAnalyzer := newFsResourceAnalyzer(statsProvider, calVolumeFrequency, eventRecorder)
+	summaryProvider := NewSummaryProvider(statsProvider)
 	return &resourceAnalyzer{fsAnalyzer, summaryProvider}
 }
 

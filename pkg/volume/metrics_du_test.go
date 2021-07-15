@@ -24,12 +24,21 @@ import (
 	"path/filepath"
 	"testing"
 
-	utiltesting "k8s.io/kubernetes/pkg/util/testing"
+	"golang.org/x/sys/unix"
+	utiltesting "k8s.io/client-go/util/testing"
 	. "k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 )
 
-const expectedBlockSize = 4096
+func getExpectedBlockSize(path string) int64 {
+	statfs := &unix.Statfs_t{}
+	err := unix.Statfs(path, statfs)
+	if err != nil {
+		return 0
+	}
+
+	return int64(statfs.Bsize)
+}
 
 // TestMetricsDuGetCapacity tests that MetricsDu can read disk usage
 // for path
@@ -69,9 +78,24 @@ func TestMetricsDuGetCapacity(t *testing.T) {
 	if err != nil {
 		t.Errorf("Unexpected error when calling GetMetrics %v", err)
 	}
-	if e, a := (expectedEmptyDirUsage.Value() + expectedBlockSize), actual.Used.Value(); e != a {
+	if e, a := (expectedEmptyDirUsage.Value() + getExpectedBlockSize(filepath.Join(tmpDir, "f1"))), actual.Used.Value(); e != a {
 		t.Errorf("Unexpected Used for directory with file.  Expected %v, got %d.", e, a)
 	}
+
+	// create a hardlink and expect inodes count to stay the same
+	previousInodes := actual.InodesUsed.Value()
+	err = os.Link(filepath.Join(tmpDir, "f1"), filepath.Join(tmpDir, "f2"))
+	if err != nil {
+		t.Errorf("Unexpected error when creating hard link %v", err)
+	}
+	actual, err = metrics.GetMetrics()
+	if err != nil {
+		t.Errorf("Unexpected error when calling GetMetrics %v", err)
+	}
+	if e, a := previousInodes, actual.InodesUsed.Value(); e != a {
+		t.Errorf("Unexpected Used for directory with file.  Expected %v, got %d.", e, a)
+	}
+
 }
 
 // TestMetricsDuRequireInit tests that if MetricsDu is not initialized with a path, GetMetrics
@@ -80,7 +104,7 @@ func TestMetricsDuRequirePath(t *testing.T) {
 	metrics := NewMetricsDu("")
 	actual, err := metrics.GetMetrics()
 	expected := &Metrics{}
-	if *actual != *expected {
+	if !volumetest.MetricsEqualIgnoreTimestamp(actual, expected) {
 		t.Errorf("Expected empty Metrics from uninitialized MetricsDu, actual %v", *actual)
 	}
 	if err == nil {
@@ -94,7 +118,7 @@ func TestMetricsDuRequireRealDirectory(t *testing.T) {
 	metrics := NewMetricsDu("/not/a/real/directory")
 	actual, err := metrics.GetMetrics()
 	expected := &Metrics{}
-	if *actual != *expected {
+	if !volumetest.MetricsEqualIgnoreTimestamp(actual, expected) {
 		t.Errorf("Expected empty Metrics from incorrectly initialized MetricsDu, actual %v", *actual)
 	}
 	if err == nil {

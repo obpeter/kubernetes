@@ -19,84 +19,31 @@ package v1
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	v1 "k8s.io/kubernetes/pkg/api/v1"
+	v1 "k8s.io/api/batch/v1"
+	"k8s.io/apimachinery/pkg/conversion"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/apis/batch"
-	"k8s.io/kubernetes/pkg/conversion"
-	"k8s.io/kubernetes/pkg/runtime"
 )
 
 func addConversionFuncs(scheme *runtime.Scheme) error {
-	// Add non-generated conversion functions
-	err := scheme.AddConversionFuncs(
-		Convert_batch_JobSpec_To_v1_JobSpec,
-		Convert_v1_JobSpec_To_batch_JobSpec,
-	)
-	if err != nil {
-		return err
-	}
-
-	return api.Scheme.AddFieldLabelConversionFunc("batch/v1", "Job",
+	return scheme.AddFieldLabelConversionFunc(SchemeGroupVersion.WithKind("Job"),
 		func(label, value string) (string, string, error) {
 			switch label {
 			case "metadata.name", "metadata.namespace", "status.successful":
 				return label, value, nil
 			default:
-				return "", "", fmt.Errorf("field label not supported: %s", label)
+				return "", "", fmt.Errorf("field label %q not supported for Job", label)
 			}
-		},
-	)
+		})
 }
 
-func Convert_batch_JobSpec_To_v1_JobSpec(in *batch.JobSpec, out *JobSpec, s conversion.Scope) error {
-	out.Parallelism = in.Parallelism
-	out.Completions = in.Completions
-	out.ActiveDeadlineSeconds = in.ActiveDeadlineSeconds
-	// unable to generate simple pointer conversion for unversioned.LabelSelector -> v1.LabelSelector
-	if in.Selector != nil {
-		out.Selector = new(LabelSelector)
-		if err := Convert_unversioned_LabelSelector_To_v1_LabelSelector(in.Selector, out.Selector, s); err != nil {
-			return err
-		}
-	} else {
-		out.Selector = nil
-	}
-	if in.ManualSelector != nil {
-		out.ManualSelector = new(bool)
-		*out.ManualSelector = *in.ManualSelector
-	} else {
-		out.ManualSelector = nil
-	}
+// The following functions don't do anything special, but they need to be added
+// here due to the dependency of v1beta1 on v1.
 
-	if err := v1.Convert_api_PodTemplateSpec_To_v1_PodTemplateSpec(&in.Template, &out.Template, s); err != nil {
-		return err
-	}
-	return nil
+func Convert_batch_JobSpec_To_v1_JobSpec(in *batch.JobSpec, out *v1.JobSpec, s conversion.Scope) error {
+	return autoConvert_batch_JobSpec_To_v1_JobSpec(in, out, s)
 }
 
-func Convert_v1_JobSpec_To_batch_JobSpec(in *JobSpec, out *batch.JobSpec, s conversion.Scope) error {
-	out.Parallelism = in.Parallelism
-	out.Completions = in.Completions
-	out.ActiveDeadlineSeconds = in.ActiveDeadlineSeconds
-	// unable to generate simple pointer conversion for v1.LabelSelector -> unversioned.LabelSelector
-	if in.Selector != nil {
-		out.Selector = new(unversioned.LabelSelector)
-		if err := Convert_v1_LabelSelector_To_unversioned_LabelSelector(in.Selector, out.Selector, s); err != nil {
-			return err
-		}
-	} else {
-		out.Selector = nil
-	}
-	if in.ManualSelector != nil {
-		out.ManualSelector = new(bool)
-		*out.ManualSelector = *in.ManualSelector
-	} else {
-		out.ManualSelector = nil
-	}
-
-	if err := v1.Convert_v1_PodTemplateSpec_To_api_PodTemplateSpec(&in.Template, &out.Template, s); err != nil {
-		return err
-	}
-	return nil
+func Convert_v1_JobSpec_To_batch_JobSpec(in *v1.JobSpec, out *batch.JobSpec, s conversion.Scope) error {
+	return autoConvert_v1_JobSpec_To_batch_JobSpec(in, out, s)
 }

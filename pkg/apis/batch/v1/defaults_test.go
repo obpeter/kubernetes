@@ -20,139 +20,242 @@ import (
 	"reflect"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	_ "k8s.io/kubernetes/pkg/api/install"
-	"k8s.io/kubernetes/pkg/api/v1"
+	"github.com/google/go-cmp/cmp"
+	batchv1 "k8s.io/api/batch/v1"
+	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	_ "k8s.io/kubernetes/pkg/apis/batch/install"
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
+	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/utils/pointer"
+
 	. "k8s.io/kubernetes/pkg/apis/batch/v1"
-	"k8s.io/kubernetes/pkg/runtime"
 )
 
 func TestSetDefaultJob(t *testing.T) {
 	defaultLabels := map[string]string{"default": "default"}
 	tests := map[string]struct {
-		original     *Job
-		expected     *Job
-		expectLabels bool
+		indexedJobEnabled bool
+		suspendJobEnabled bool
+		original          *batchv1.Job
+		expected          *batchv1.Job
+		expectLabels      bool
 	}{
-		"both unspecified -> sets both to 1": {
-			original: &Job{
-				Spec: JobSpec{
+		"All unspecified -> sets all to default values": {
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
 					Template: v1.PodTemplateSpec{
-						ObjectMeta: v1.ObjectMeta{Labels: defaultLabels},
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
 					},
 				},
 			},
-			expected: &Job{
-				Spec: JobSpec{
-					Completions: newInt32(1),
-					Parallelism: newInt32(1),
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:  pointer.Int32Ptr(1),
+					Parallelism:  pointer.Int32Ptr(1),
+					BackoffLimit: pointer.Int32Ptr(6),
 				},
 			},
 			expectLabels: true,
 		},
-		"both unspecified -> sets both to 1 and no default labels": {
-			original: &Job{
-				ObjectMeta: v1.ObjectMeta{
+		"All unspecified, indexed job enabled -> sets all to default values": {
+			indexedJobEnabled: true,
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
+					},
+				},
+			},
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:    pointer.Int32Ptr(1),
+					Parallelism:    pointer.Int32Ptr(1),
+					BackoffLimit:   pointer.Int32Ptr(6),
+					CompletionMode: completionModePtr(batchv1.NonIndexedCompletion),
+				},
+			},
+			expectLabels: true,
+		},
+		"All unspecified, suspend job enabled -> sets all to default values": {
+			suspendJobEnabled: true,
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
+					},
+				},
+			},
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:  pointer.Int32Ptr(1),
+					Parallelism:  pointer.Int32Ptr(1),
+					BackoffLimit: pointer.Int32Ptr(6),
+					Suspend:      pointer.BoolPtr(false),
+				},
+			},
+			expectLabels: true,
+		},
+		"suspend set, everything else is defaulted": {
+			suspendJobEnabled: true,
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Suspend: pointer.BoolPtr(true),
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
+					},
+				},
+			},
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:  pointer.Int32Ptr(1),
+					Parallelism:  pointer.Int32Ptr(1),
+					BackoffLimit: pointer.Int32Ptr(6),
+					Suspend:      pointer.BoolPtr(true),
+				},
+			},
+			expectLabels: true,
+		},
+		"All unspecified -> all pointers are defaulted and no default labels": {
+			original: &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{
 					Labels: map[string]string{"mylabel": "myvalue"},
 				},
-				Spec: JobSpec{
+				Spec: batchv1.JobSpec{
 					Template: v1.PodTemplateSpec{
-						ObjectMeta: v1.ObjectMeta{Labels: defaultLabels},
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
 					},
 				},
 			},
-			expected: &Job{
-				Spec: JobSpec{
-					Completions: newInt32(1),
-					Parallelism: newInt32(1),
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:  pointer.Int32Ptr(1),
+					Parallelism:  pointer.Int32Ptr(1),
+					BackoffLimit: pointer.Int32Ptr(6),
 				},
 			},
 		},
-		"WQ: Parallelism explicitly 0 and completions unset -> no change": {
-			original: &Job{
-				Spec: JobSpec{
-					Parallelism: newInt32(0),
+		"WQ: Parallelism explicitly 0 and completions unset -> BackoffLimit is defaulted": {
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Parallelism: pointer.Int32Ptr(0),
 					Template: v1.PodTemplateSpec{
-						ObjectMeta: v1.ObjectMeta{Labels: defaultLabels},
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
 					},
 				},
 			},
-			expected: &Job{
-				Spec: JobSpec{
-					Parallelism: newInt32(0),
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Parallelism:  pointer.Int32Ptr(0),
+					BackoffLimit: pointer.Int32Ptr(6),
 				},
 			},
 			expectLabels: true,
 		},
-		"WQ: Parallelism explicitly 2 and completions unset -> no change": {
-			original: &Job{
-				Spec: JobSpec{
-					Parallelism: newInt32(2),
+		"WQ: Parallelism explicitly 2 and completions unset -> BackoffLimit is defaulted": {
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Parallelism: pointer.Int32Ptr(2),
 					Template: v1.PodTemplateSpec{
-						ObjectMeta: v1.ObjectMeta{Labels: defaultLabels},
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
 					},
 				},
 			},
-			expected: &Job{
-				Spec: JobSpec{
-					Parallelism: newInt32(2),
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Parallelism:  pointer.Int32Ptr(2),
+					BackoffLimit: pointer.Int32Ptr(6),
 				},
 			},
 			expectLabels: true,
 		},
-		"Completions explicitly 2 and parallelism unset -> parallelism is defaulted": {
-			original: &Job{
-				Spec: JobSpec{
-					Completions: newInt32(2),
+		"Completions explicitly 2 and others unset -> parallelism and BackoffLimit are defaulted": {
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions: pointer.Int32Ptr(2),
 					Template: v1.PodTemplateSpec{
-						ObjectMeta: v1.ObjectMeta{Labels: defaultLabels},
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
 					},
 				},
 			},
-			expected: &Job{
-				Spec: JobSpec{
-					Completions: newInt32(2),
-					Parallelism: newInt32(1),
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:  pointer.Int32Ptr(2),
+					Parallelism:  pointer.Int32Ptr(1),
+					BackoffLimit: pointer.Int32Ptr(6),
 				},
 			},
 			expectLabels: true,
 		},
-		"Both set -> no change": {
-			original: &Job{
-				Spec: JobSpec{
-					Completions: newInt32(10),
-					Parallelism: newInt32(11),
+		"BackoffLimit explicitly 5 and others unset -> parallelism and completions are defaulted": {
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					BackoffLimit: pointer.Int32Ptr(5),
 					Template: v1.PodTemplateSpec{
-						ObjectMeta: v1.ObjectMeta{Labels: defaultLabels},
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
 					},
 				},
 			},
-			expected: &Job{
-				Spec: JobSpec{
-					Completions: newInt32(10),
-					Parallelism: newInt32(11),
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:  pointer.Int32Ptr(1),
+					Parallelism:  pointer.Int32Ptr(1),
+					BackoffLimit: pointer.Int32Ptr(5),
+				},
+			},
+			expectLabels: true,
+		},
+		"All set -> no change": {
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:    pointer.Int32Ptr(8),
+					Parallelism:    pointer.Int32Ptr(9),
+					BackoffLimit:   pointer.Int32Ptr(10),
+					CompletionMode: completionModePtr(batchv1.NonIndexedCompletion),
+					Suspend:        pointer.BoolPtr(false),
 					Template: v1.PodTemplateSpec{
-						ObjectMeta: v1.ObjectMeta{Labels: defaultLabels},
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
+					},
+				},
+			},
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:    pointer.Int32Ptr(8),
+					Parallelism:    pointer.Int32Ptr(9),
+					BackoffLimit:   pointer.Int32Ptr(10),
+					CompletionMode: completionModePtr(batchv1.NonIndexedCompletion),
+					Suspend:        pointer.BoolPtr(false),
+					Template: v1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
 					},
 				},
 			},
 			expectLabels: true,
 		},
-		"Both set, flipped -> no change": {
-			original: &Job{
-				Spec: JobSpec{
-					Completions: newInt32(11),
-					Parallelism: newInt32(10),
+		"All set, flipped -> no change": {
+			original: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:    pointer.Int32Ptr(11),
+					Parallelism:    pointer.Int32Ptr(10),
+					BackoffLimit:   pointer.Int32Ptr(9),
+					CompletionMode: completionModePtr(batchv1.IndexedCompletion),
+					Suspend:        pointer.BoolPtr(true),
 					Template: v1.PodTemplateSpec{
-						ObjectMeta: v1.ObjectMeta{Labels: defaultLabels},
+						ObjectMeta: metav1.ObjectMeta{Labels: defaultLabels},
 					},
 				},
 			},
-			expected: &Job{
-				Spec: JobSpec{
-					Completions: newInt32(11),
-					Parallelism: newInt32(10),
+			expected: &batchv1.Job{
+				Spec: batchv1.JobSpec{
+					Completions:    pointer.Int32Ptr(11),
+					Parallelism:    pointer.Int32Ptr(10),
+					BackoffLimit:   pointer.Int32Ptr(9),
+					CompletionMode: completionModePtr(batchv1.IndexedCompletion),
+					Suspend:        pointer.BoolPtr(true),
 				},
 			},
 			expectLabels: true,
@@ -160,54 +263,63 @@ func TestSetDefaultJob(t *testing.T) {
 	}
 
 	for name, test := range tests {
-		original := test.original
-		expected := test.expected
-		obj2 := roundTrip(t, runtime.Object(original))
-		actual, ok := obj2.(*Job)
-		if !ok {
-			t.Errorf("%s: unexpected object: %v", name, actual)
-			t.FailNow()
-		}
-		if (actual.Spec.Completions == nil) != (expected.Spec.Completions == nil) {
-			t.Errorf("%s: got different *completions than expected: %v %v", name, actual.Spec.Completions, expected.Spec.Completions)
-		}
-		if actual.Spec.Completions != nil && expected.Spec.Completions != nil {
-			if *actual.Spec.Completions != *expected.Spec.Completions {
-				t.Errorf("%s: got different completions than expected: %d %d", name, *actual.Spec.Completions, *expected.Spec.Completions)
-			}
-		}
-		if (actual.Spec.Parallelism == nil) != (expected.Spec.Parallelism == nil) {
-			t.Errorf("%s: got different *Parallelism than expected: %v %v", name, actual.Spec.Parallelism, expected.Spec.Parallelism)
-		}
-		if actual.Spec.Parallelism != nil && expected.Spec.Parallelism != nil {
-			if *actual.Spec.Parallelism != *expected.Spec.Parallelism {
-				t.Errorf("%s: got different parallelism than expected: %d %d", name, *actual.Spec.Parallelism, *expected.Spec.Parallelism)
-			}
-		}
-		if test.expectLabels != reflect.DeepEqual(actual.Labels, actual.Spec.Template.Labels) {
-			if test.expectLabels {
-				t.Errorf("%s: expected: %v, got: %v", name, actual.Spec.Template.Labels, actual.Labels)
-			} else {
-				t.Errorf("%s: unexpected equality: %v", name, actual.Labels)
-			}
-		}
+		t.Run(name, func(t *testing.T) {
+			defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.IndexedJob, test.indexedJobEnabled)()
+			defer featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.SuspendJob, test.suspendJobEnabled)()
 
+			original := test.original
+			expected := test.expected
+			obj2 := roundTrip(t, runtime.Object(original))
+			actual, ok := obj2.(*batchv1.Job)
+			if !ok {
+				t.Fatalf("Unexpected object: %v", actual)
+			}
+
+			if diff := cmp.Diff(expected.Spec.Suspend, actual.Spec.Suspend); diff != "" {
+				t.Errorf(".spec.suspend does not match; -want,+got:\n%s", diff)
+			}
+			validateDefaultInt32(t, "Completions", actual.Spec.Completions, expected.Spec.Completions)
+			validateDefaultInt32(t, "Parallelism", actual.Spec.Parallelism, expected.Spec.Parallelism)
+			validateDefaultInt32(t, "BackoffLimit", actual.Spec.BackoffLimit, expected.Spec.BackoffLimit)
+
+			if test.expectLabels != reflect.DeepEqual(actual.Labels, actual.Spec.Template.Labels) {
+				if test.expectLabels {
+					t.Errorf("Expected labels: %v, got: %v", actual.Spec.Template.Labels, actual.Labels)
+				} else {
+					t.Errorf("Unexpected equality: %v", actual.Labels)
+				}
+			}
+			if diff := cmp.Diff(expected.Spec.CompletionMode, actual.Spec.CompletionMode); diff != "" {
+				t.Errorf("Unexpected CompletionMode (-want,+got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func validateDefaultInt32(t *testing.T, field string, actual *int32, expected *int32) {
+	if (actual == nil) != (expected == nil) {
+		t.Errorf("Got different *%s than expected: %v %v", field, actual, expected)
+	}
+	if actual != nil && expected != nil {
+		if *actual != *expected {
+			t.Errorf("Got different %s than expected: %d %d", field, *actual, *expected)
+		}
 	}
 }
 
 func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
-	data, err := runtime.Encode(api.Codecs.LegacyCodec(SchemeGroupVersion), obj)
+	data, err := runtime.Encode(legacyscheme.Codecs.LegacyCodec(SchemeGroupVersion), obj)
 	if err != nil {
 		t.Errorf("%v\n %#v", err, obj)
 		return nil
 	}
-	obj2, err := runtime.Decode(api.Codecs.UniversalDecoder(), data)
+	obj2, err := runtime.Decode(legacyscheme.Codecs.UniversalDecoder(), data)
 	if err != nil {
 		t.Errorf("%v\nData: %s\nSource: %#v", err, string(data), obj)
 		return nil
 	}
 	obj3 := reflect.New(reflect.TypeOf(obj).Elem()).Interface().(runtime.Object)
-	err = api.Scheme.Convert(obj2, obj3, nil)
+	err = legacyscheme.Scheme.Convert(obj2, obj3, nil)
 	if err != nil {
 		t.Errorf("%v\nSource: %#v", err, obj2)
 		return nil
@@ -215,8 +327,66 @@ func roundTrip(t *testing.T, obj runtime.Object) runtime.Object {
 	return obj3
 }
 
-func newInt32(val int32) *int32 {
-	p := new(int32)
-	*p = val
-	return p
+func TestSetDefaultCronJob(t *testing.T) {
+	tests := map[string]struct {
+		original *batchv1.CronJob
+		expected *batchv1.CronJob
+	}{
+		"empty batchv1.CronJob should default batchv1.ConcurrencyPolicy and Suspend": {
+			original: &batchv1.CronJob{},
+			expected: &batchv1.CronJob{
+				Spec: batchv1.CronJobSpec{
+					ConcurrencyPolicy:          batchv1.AllowConcurrent,
+					Suspend:                    pointer.BoolPtr(false),
+					SuccessfulJobsHistoryLimit: pointer.Int32Ptr(3),
+					FailedJobsHistoryLimit:     pointer.Int32Ptr(1),
+				},
+			},
+		},
+		"set fields should not be defaulted": {
+			original: &batchv1.CronJob{
+				Spec: batchv1.CronJobSpec{
+					ConcurrencyPolicy:          batchv1.ForbidConcurrent,
+					Suspend:                    pointer.BoolPtr(true),
+					SuccessfulJobsHistoryLimit: pointer.Int32Ptr(5),
+					FailedJobsHistoryLimit:     pointer.Int32Ptr(5),
+				},
+			},
+			expected: &batchv1.CronJob{
+				Spec: batchv1.CronJobSpec{
+					ConcurrencyPolicy:          batchv1.ForbidConcurrent,
+					Suspend:                    pointer.BoolPtr(true),
+					SuccessfulJobsHistoryLimit: pointer.Int32Ptr(5),
+					FailedJobsHistoryLimit:     pointer.Int32Ptr(5),
+				},
+			},
+		},
+	}
+
+	for name, test := range tests {
+		original := test.original
+		expected := test.expected
+		obj2 := roundTrip(t, runtime.Object(original))
+		actual, ok := obj2.(*batchv1.CronJob)
+		if !ok {
+			t.Errorf("%s: unexpected object: %v", name, actual)
+			t.FailNow()
+		}
+		if actual.Spec.ConcurrencyPolicy != expected.Spec.ConcurrencyPolicy {
+			t.Errorf("%s: got different concurrencyPolicy than expected: %v %v", name, actual.Spec.ConcurrencyPolicy, expected.Spec.ConcurrencyPolicy)
+		}
+		if *actual.Spec.Suspend != *expected.Spec.Suspend {
+			t.Errorf("%s: got different suspend than expected: %v %v", name, *actual.Spec.Suspend, *expected.Spec.Suspend)
+		}
+		if *actual.Spec.SuccessfulJobsHistoryLimit != *expected.Spec.SuccessfulJobsHistoryLimit {
+			t.Errorf("%s: got different successfulJobsHistoryLimit than expected: %v %v", name, *actual.Spec.SuccessfulJobsHistoryLimit, *expected.Spec.SuccessfulJobsHistoryLimit)
+		}
+		if *actual.Spec.FailedJobsHistoryLimit != *expected.Spec.FailedJobsHistoryLimit {
+			t.Errorf("%s: got different failedJobsHistoryLimit than expected: %v %v", name, *actual.Spec.FailedJobsHistoryLimit, *expected.Spec.FailedJobsHistoryLimit)
+		}
+	}
+}
+
+func completionModePtr(m batchv1.CompletionMode) *batchv1.CompletionMode {
+	return &m
 }

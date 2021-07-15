@@ -1,5 +1,5 @@
 /*
-Copyright 2015 The Kubernetes Authors.
+Copyright 2021 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,16 +19,72 @@ package podtemplate
 import (
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	apitesting "k8s.io/kubernetes/pkg/api/testing"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
-func TestSelectableFieldLabelConversions(t *testing.T) {
-	apitesting.TestSelectableFieldLabelConversionsOfKind(t,
-		testapi.Default.GroupVersion().String(),
-		"PodTemplate",
-		PodTemplateToSelectableFields(&api.PodTemplate{}),
-		nil,
-	)
+func TestStrategy(t *testing.T) {
+	ctx := genericapirequest.NewDefaultContext()
+	if !Strategy.NamespaceScoped() {
+		t.Errorf("must be namespace scoped")
+	}
+	if Strategy.AllowCreateOnUpdate() {
+		t.Errorf("should not allow create on update")
+	}
+
+	podTemplate := &api.PodTemplate{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "mytemplate",
+			Namespace:  metav1.NamespaceDefault,
+			Generation: 999,
+		},
+		Template: api.PodTemplateSpec{
+			Spec: api.PodSpec{
+				RestartPolicy: api.RestartPolicyOnFailure,
+				DNSPolicy:     api.DNSClusterFirst,
+				Containers:    []api.Container{{Name: "abc", Image: "image", ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
+			},
+		},
+	}
+
+	Strategy.PrepareForCreate(ctx, podTemplate)
+	if podTemplate.Generation != 1 {
+		t.Errorf("expected Generation=1, got %d", podTemplate.Generation)
+	}
+	errs := Strategy.Validate(ctx, podTemplate)
+	if len(errs) != 0 {
+		t.Errorf("Unexpected error validating %v", errs)
+	}
+
+	// ensure we do not change generation for non-spec updates
+	updatedLabel := podTemplate.DeepCopy()
+	updatedLabel.Labels = map[string]string{"a": "true"}
+	Strategy.PrepareForUpdate(ctx, updatedLabel, podTemplate)
+	if updatedLabel.Generation != 1 {
+		t.Errorf("expected Generation=1, got %d", updatedLabel.Generation)
+	}
+
+	updatedTemplate := podTemplate.DeepCopy()
+	updatedTemplate.ResourceVersion = "10"
+	updatedTemplate.Generation = 999
+	updatedTemplate.Template.Spec.RestartPolicy = api.RestartPolicyNever
+
+	// ensure generation is updated for spec changes
+	Strategy.PrepareForUpdate(ctx, updatedTemplate, podTemplate)
+	if updatedTemplate.Generation != 2 {
+		t.Errorf("expected Generation=2, got %d", updatedTemplate.Generation)
+	}
+	errs = Strategy.ValidateUpdate(ctx, updatedTemplate, podTemplate)
+	if len(errs) != 0 {
+		t.Errorf("Unexpected error validating %v", errs)
+	}
+
+	invalidUpdatedTemplate := updatedTemplate.DeepCopy()
+	invalidUpdatedTemplate.Name = "changed"
+	Strategy.PrepareForUpdate(ctx, invalidUpdatedTemplate, podTemplate)
+	errs = Strategy.ValidateUpdate(ctx, invalidUpdatedTemplate, podTemplate)
+	if len(errs) == 0 {
+		t.Errorf("expected error validating, got none")
+	}
 }

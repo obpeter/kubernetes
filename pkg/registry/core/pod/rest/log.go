@@ -17,23 +17,29 @@ limitations under the License.
 package rest
 
 import (
+	"context"
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/api/rest"
-	"k8s.io/kubernetes/pkg/api/validation"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
+	genericrest "k8s.io/apiserver/pkg/registry/generic/rest"
+	"k8s.io/apiserver/pkg/registry/rest"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 	"k8s.io/kubernetes/pkg/kubelet/client"
 	"k8s.io/kubernetes/pkg/registry/core/pod"
-	"k8s.io/kubernetes/pkg/registry/generic/registry"
-	genericrest "k8s.io/kubernetes/pkg/registry/generic/rest"
-	"k8s.io/kubernetes/pkg/runtime"
+
+	// ensure types are installed
+	_ "k8s.io/kubernetes/pkg/apis/core/install"
 )
 
 // LogREST implements the log endpoint for a Pod
 type LogREST struct {
 	KubeletConn client.ConnectionInfoGetter
-	Store       *registry.Store
+	Store       *genericregistry.Store
 }
 
 // LogREST implements GetterWithOptions
@@ -45,7 +51,8 @@ func (r *LogREST) New() runtime.Object {
 	return &api.Pod{}
 }
 
-// LogREST implements StorageMetadata
+// ProducesMIMETypes returns a list of the MIME types the specified HTTP verb (GET, POST, DELETE,
+// PATCH) can respond with.
 func (r *LogREST) ProducesMIMETypes(verb string) []string {
 	// Since the default list does not include "plain/text", we need to
 	// explicitly override ProducesMIMETypes, so that it gets added to
@@ -55,29 +62,68 @@ func (r *LogREST) ProducesMIMETypes(verb string) []string {
 	}
 }
 
+// ProducesObject returns an object the specified HTTP verb respond with. It will overwrite storage object if
+// it is not nil. Only the type of the return object matters, the value will be ignored.
+func (r *LogREST) ProducesObject(verb string) interface{} {
+	return ""
+}
+
 // Get retrieves a runtime.Object that will stream the contents of the pod log
-func (r *LogREST) Get(ctx api.Context, name string, opts runtime.Object) (runtime.Object, error) {
+func (r *LogREST) Get(ctx context.Context, name string, opts runtime.Object) (runtime.Object, error) {
+	// register the metrics if the context is used.  This assumes sync.Once is fast.  If it's not, it could be an init block.
+	registerMetrics()
+
 	logOpts, ok := opts.(*api.PodLogOptions)
 	if !ok {
 		return nil, fmt.Errorf("invalid options object: %#v", opts)
 	}
+
+	countSkipTLSMetric(logOpts.InsecureSkipTLSVerifyBackend)
+
 	if errs := validation.ValidatePodLogOptions(logOpts); len(errs) > 0 {
 		return nil, errors.NewInvalid(api.Kind("PodLogOptions"), name, errs)
 	}
-	location, transport, err := pod.LogLocation(r.Store, r.KubeletConn, ctx, name, logOpts)
+	location, transport, err := pod.LogLocation(ctx, r.Store, r.KubeletConn, name, logOpts)
 	if err != nil {
 		return nil, err
 	}
 	return &genericrest.LocationStreamer{
-		Location:        location,
-		Transport:       transport,
-		ContentType:     "text/plain",
-		Flush:           logOpts.Follow,
-		ResponseChecker: genericrest.NewGenericHttpResponseChecker(api.Resource("pods/log"), name),
+		Location:                    location,
+		Transport:                   transport,
+		ContentType:                 "text/plain",
+		Flush:                       logOpts.Follow,
+		ResponseChecker:             genericrest.NewGenericHttpResponseChecker(api.Resource("pods/log"), name),
+		RedirectChecker:             genericrest.PreventRedirects,
+		TLSVerificationErrorCounter: podLogsTLSFailure,
 	}, nil
+}
+
+func countSkipTLSMetric(insecureSkipTLSVerifyBackend bool) {
+	usageType := usageEnforce
+	if insecureSkipTLSVerifyBackend {
+		usageType = usageSkipAllowed
+	}
+
+	counter, err := podLogsUsage.GetMetricWithLabelValues(usageType)
+	if err != nil {
+		utilruntime.HandleError(err)
+		return
+	}
+	counter.Inc()
 }
 
 // NewGetOptions creates a new options object
 func (r *LogREST) NewGetOptions() (runtime.Object, bool, string) {
 	return &api.PodLogOptions{}, false, ""
+}
+
+// OverrideMetricsVerb override the GET verb to CONNECT for pod log resource
+func (r *LogREST) OverrideMetricsVerb(oldVerb string) (newVerb string) {
+	newVerb = oldVerb
+
+	if oldVerb == "GET" {
+		newVerb = "CONNECT"
+	}
+
+	return
 }
