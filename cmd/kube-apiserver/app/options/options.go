@@ -18,108 +18,152 @@ limitations under the License.
 package options
 
 import (
+	"net"
+	"strings"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api/validation"
-	genericoptions "k8s.io/kubernetes/pkg/genericapiserver/options"
-	kubeletclient "k8s.io/kubernetes/pkg/kubelet/client"
-	"k8s.io/kubernetes/pkg/master/ports"
+	v1 "k8s.io/api/core/v1"
+	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/cache"
+	cliflag "k8s.io/component-base/cli/flag"
 
-	"github.com/spf13/pflag"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/cluster/ports"
+	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver/options"
+	"k8s.io/kubernetes/pkg/controlplane/reconcilers"
+	_ "k8s.io/kubernetes/pkg/features" // add the kubernetes feature gates
+	kubeoptions "k8s.io/kubernetes/pkg/kubeapiserver/options"
+	kubeletclient "k8s.io/kubernetes/pkg/kubelet/client"
+	podregistry "k8s.io/kubernetes/pkg/registry/core/pod"
 )
 
-// APIServer runs a kubernetes api server.
-type APIServer struct {
-	*genericoptions.ServerRunOptions
-	AllowPrivileged             bool
-	EventTTL                    time.Duration
-	KubeletConfig               kubeletclient.KubeletClientConfig
-	MaxConnectionBytesPerSec    int64
-	SSHKeyfile                  string
-	SSHUser                     string
-	ServiceAccountKeyFile       string
-	ServiceAccountLookup        bool
-	WebhookTokenAuthnConfigFile string
-	WebhookTokenAuthnCacheTTL   time.Duration
+// ServerRunOptions runs a kubernetes api server.
+type ServerRunOptions struct {
+	*controlplaneapiserver.Options // embedded to avoid noise in existing consumers
+
+	Extra
 }
 
-// NewAPIServer creates a new APIServer object with default parameters
-func NewAPIServer() *APIServer {
-	s := APIServer{
-		ServerRunOptions: genericoptions.NewServerRunOptions().WithEtcdOptions(),
-		EventTTL:         1 * time.Hour,
-		KubeletConfig: kubeletclient.KubeletClientConfig{
-			Port:        ports.KubeletPort,
-			EnableHttps: true,
-			HTTPTimeout: time.Duration(5) * time.Second,
+type Extra struct {
+	AllowPrivileged           bool
+	KubeletConfig             kubeletclient.KubeletClientConfig
+	KubernetesServiceNodePort int
+	// ServiceClusterIPRange is mapped to input provided by user
+	ServiceClusterIPRanges string
+	// PrimaryServiceClusterIPRange and SecondaryServiceClusterIPRange are the results
+	// of parsing ServiceClusterIPRange into actual values
+	PrimaryServiceClusterIPRange   net.IPNet
+	SecondaryServiceClusterIPRange net.IPNet
+	// APIServerServiceIP is the first valid IP from PrimaryServiceClusterIPRange
+	APIServerServiceIP net.IP
+
+	ServiceNodePortRange utilnet.PortRange
+
+	EndpointReconcilerType string
+
+	MasterCount int
+
+	DisablePodSubresources []string
+
+	InformerName *cache.InformerName
+}
+
+// NewServerRunOptions creates and returns ServerRunOptions according to the given featureGate and effectiveVersion of the server binary to run.
+func NewServerRunOptions() *ServerRunOptions {
+	s := ServerRunOptions{
+		Options: controlplaneapiserver.NewOptions(),
+
+		Extra: Extra{
+			EndpointReconcilerType: string(reconcilers.LeaseEndpointReconcilerType),
+			KubeletConfig: kubeletclient.KubeletClientConfig{
+				Port:         ports.KubeletPort,
+				ReadOnlyPort: ports.KubeletReadOnlyPort,
+				PreferredAddressTypes: []string{
+					// --override-hostname
+					string(api.NodeHostName),
+
+					// internal, preferring DNS if reported
+					string(api.NodeInternalDNS),
+					string(api.NodeInternalIP),
+
+					// external, preferring DNS if reported
+					string(api.NodeExternalDNS),
+					string(api.NodeExternalIP),
+				},
+				HTTPTimeout: time.Duration(5) * time.Second,
+			},
+			ServiceNodePortRange: kubeoptions.DefaultServiceNodePortRange,
+			MasterCount:          1,
 		},
-		WebhookTokenAuthnCacheTTL: 2 * time.Minute,
 	}
+
+	s.Options.SystemNamespaces = append(s.Options.SystemNamespaces, v1.NamespaceNodeLease)
+
 	return &s
 }
 
-// AddFlags adds flags for a specific APIServer to the specified FlagSet
-func (s *APIServer) AddFlags(fs *pflag.FlagSet) {
-	// Add the generic flags.
-	s.ServerRunOptions.AddUniversalFlags(fs)
-	//Add etcd specific flags.
-	s.ServerRunOptions.AddEtcdStorageFlags(fs)
+// Flags returns flags for a specific APIServer by section name
+func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
+	s.Options.AddFlags(&fss)
+
 	// Note: the weird ""+ in below lines seems to be the only way to get gofmt to
 	// arrange these text blocks sensibly. Grrr.
-
-	fs.DurationVar(&s.EventTTL, "event-ttl", s.EventTTL,
-		"Amount of time to retain events. Default is 1h.")
-
-	fs.StringVar(&s.ServiceAccountKeyFile, "service-account-key-file", s.ServiceAccountKeyFile, ""+
-		"File containing PEM-encoded x509 RSA or ECDSA private or public key, used to verify "+
-		"ServiceAccount tokens. If unspecified, --tls-private-key-file is used.")
-
-	fs.BoolVar(&s.ServiceAccountLookup, "service-account-lookup", s.ServiceAccountLookup,
-		"If true, validate ServiceAccount tokens exist in etcd as part of authentication.")
-
-	fs.StringVar(&s.WebhookTokenAuthnConfigFile, "authentication-token-webhook-config-file", s.WebhookTokenAuthnConfigFile, ""+
-		"File with webhook configuration for token authentication in kubeconfig format. "+
-		"The API server will query the remote service to determine authentication for bearer tokens.")
-
-	fs.DurationVar(&s.WebhookTokenAuthnCacheTTL, "authentication-token-webhook-cache-ttl", s.WebhookTokenAuthnCacheTTL,
-		"The duration to cache responses from the webhook token authenticator. Default is 2m.")
+	fs := fss.FlagSet("misc")
 
 	fs.BoolVar(&s.AllowPrivileged, "allow-privileged", s.AllowPrivileged,
-		"If true, allow privileged containers.")
+		"If true, allow privileged containers. [default=false]")
 
-	fs.StringVar(&s.SSHUser, "ssh-user", s.SSHUser,
-		"If non-empty, use secure SSH proxy to the nodes, using this user name")
+	fs.StringVar(&s.EndpointReconcilerType, "endpoint-reconciler-type", s.EndpointReconcilerType,
+		"Use an endpoint reconciler ("+strings.Join(reconcilers.AllTypes.Names(), ", ")+") master-count is deprecated, and will be removed in a future version.")
 
-	fs.StringVar(&s.SSHKeyfile, "ssh-keyfile", s.SSHKeyfile,
-		"If non-empty, use secure SSH proxy to the nodes, using this user keyfile")
+	// See #14282 for details on how to test/try this option out.
+	// TODO: remove this comment once this option is tested in CI.
+	fs.IntVar(&s.KubernetesServiceNodePort, "kubernetes-service-node-port", s.KubernetesServiceNodePort, ""+
+		"If non-zero, the Kubernetes master service (which apiserver creates/maintains) will be "+
+		"of type NodePort, using this as the value of the port. If zero, the Kubernetes master "+
+		"service will be of type ClusterIP.")
 
-	fs.Int64Var(&s.MaxConnectionBytesPerSec, "max-connection-bytes-per-sec", s.MaxConnectionBytesPerSec, ""+
-		"If non-zero, throttle each user connection to this number of bytes/sec. "+
-		"Currently only applies to long-running requests.")
+	fs.StringVar(&s.ServiceClusterIPRanges, "service-cluster-ip-range", s.ServiceClusterIPRanges, ""+
+		"A CIDR notation IP range from which to assign service cluster IPs. This must not "+
+		"overlap with any IP ranges assigned to nodes or pods. Max of two dual-stack CIDRs is allowed.")
+
+	fs.Var(&s.ServiceNodePortRange, "service-node-port-range", ""+
+		"A port range to reserve for services with NodePort visibility.  This must not overlap with the ephemeral port range on nodes.  "+
+		"Example: '30000-32767'. Inclusive at both ends of the range.")
 
 	// Kubelet related flags:
-	fs.BoolVar(&s.KubeletConfig.EnableHttps, "kubelet-https", s.KubeletConfig.EnableHttps,
-		"Use https for kubelet connections.")
+	fs.StringSliceVar(&s.KubeletConfig.PreferredAddressTypes, "kubelet-preferred-address-types", s.KubeletConfig.PreferredAddressTypes,
+		"List of the preferred NodeAddressTypes to use for kubelet connections.")
 
 	fs.UintVar(&s.KubeletConfig.Port, "kubelet-port", s.KubeletConfig.Port,
 		"DEPRECATED: kubelet port.")
 	fs.MarkDeprecated("kubelet-port", "kubelet-port is deprecated and will be removed.")
 
+	fs.UintVar(&s.KubeletConfig.ReadOnlyPort, "kubelet-read-only-port", s.KubeletConfig.ReadOnlyPort,
+		"DEPRECATED: kubelet read only port.")
+	fs.MarkDeprecated("kubelet-read-only-port", "kubelet-read-only-port is deprecated and will be removed.")
+
 	fs.DurationVar(&s.KubeletConfig.HTTPTimeout, "kubelet-timeout", s.KubeletConfig.HTTPTimeout,
 		"Timeout for kubelet operations.")
 
-	fs.StringVar(&s.KubeletConfig.CertFile, "kubelet-client-certificate", s.KubeletConfig.CertFile,
+	fs.StringVar(&s.KubeletConfig.TLSClientConfig.CertFile, "kubelet-client-certificate", s.KubeletConfig.TLSClientConfig.CertFile,
 		"Path to a client cert file for TLS.")
 
-	fs.StringVar(&s.KubeletConfig.KeyFile, "kubelet-client-key", s.KubeletConfig.KeyFile,
+	fs.StringVar(&s.KubeletConfig.TLSClientConfig.KeyFile, "kubelet-client-key", s.KubeletConfig.TLSClientConfig.KeyFile,
 		"Path to a client key file for TLS.")
 
-	fs.StringVar(&s.KubeletConfig.CAFile, "kubelet-certificate-authority", s.KubeletConfig.CAFile,
+	fs.StringVar(&s.KubeletConfig.TLSClientConfig.CAFile, "kubelet-certificate-authority", s.KubeletConfig.TLSClientConfig.CAFile,
 		"Path to a cert file for the certificate authority.")
 
-	// TODO: delete this flag as soon as we identify and fix all clients that send malformed updates, like #14126.
-	fs.BoolVar(&validation.RepairMalformedUpdates, "repair-malformed-updates", validation.RepairMalformedUpdates, ""+
-		"If true, server will do its best to fix the update request to pass the validation, "+
-		"e.g., setting empty UID in update request to its existing value. This flag can be turned off "+
-		"after we fix all the clients that send malformed updates.")
+	fs.IntVar(&s.MasterCount, "apiserver-count", s.MasterCount,
+		"The number of apiservers running in the cluster, must be a positive number. (In use when --endpoint-reconciler-type=master-count is enabled.)")
+	fs.MarkDeprecated("apiserver-count", "apiserver-count is deprecated and will be removed in a future version.")
+
+	fs.StringSliceVar(&s.DisablePodSubresources, "disable-pod-subresources", s.DisablePodSubresources, ""+
+		"Comma-separated list of pod subresources to disable on the API server. "+
+		"Valid values are: "+strings.Join(sets.List(podregistry.DisableablePodSubresources()), ", ")+". "+
+		"Core lifecycle subresources ("+strings.Join(sets.List(podregistry.NonDisableablePodSubresources()), ", ")+") cannot be disabled.")
+
+	return fss
 }

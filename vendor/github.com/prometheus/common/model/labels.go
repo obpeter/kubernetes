@@ -17,12 +17,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
-	// AlertNameLabel is the name of the label containing the an alert's name.
+	// AlertNameLabel is the name of the label containing the alert's name.
 	AlertNameLabel = "alertname"
 
 	// ExportedLabelPrefix is the prefix to prepend to the label names present in
@@ -32,6 +32,12 @@ const (
 	// MetricNameLabel is the label name indicating the metric name of a
 	// timeseries.
 	MetricNameLabel = "__name__"
+	// MetricTypeLabel is the label name indicating the metric type of
+	// timeseries as per the PROM-39 proposal.
+	MetricTypeLabel = "__type__"
+	// MetricUnitLabel is the label name indicating the metric unit of
+	// timeseries as per the PROM-39 proposal.
+	MetricUnitLabel = "__unit__"
 
 	// SchemeLabel is the name of the label that holds the scheme on which to
 	// scrape a target.
@@ -44,6 +50,14 @@ const (
 	// MetricsPathLabel is the name of the label that holds the path on which to
 	// scrape a target.
 	MetricsPathLabel = "__metrics_path__"
+
+	// ScrapeIntervalLabel is the name of the label that holds the scrape interval
+	// used to scrape a target.
+	ScrapeIntervalLabel = "__scrape_interval__"
+
+	// ScrapeTimeoutLabel is the name of the label that holds the scrape
+	// timeout used to scrape a target.
+	ScrapeTimeoutLabel = "__scrape_timeout__"
 
 	// ReservedLabelPrefix is a prefix which is not legal in user-supplied
 	// label names.
@@ -80,20 +94,42 @@ const (
 	QuantileLabel = "quantile"
 )
 
-// LabelNameRE is a regular expression matching valid label names.
+// LabelNameRE is a regular expression matching valid label names. Note that the
+// IsValid method of LabelName performs the same check but faster than a match
+// with this regular expression.
 var LabelNameRE = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 // A LabelName is a key for a LabelSet or Metric.  It has a value associated
 // therewith.
 type LabelName string
 
+// IsValid returns true iff the name matches the pattern of LabelNameRE when
+// NameValidationScheme is set to LegacyValidation, or valid UTF-8 if
+// NameValidationScheme is set to UTF8Validation.
+//
+// Deprecated: This method should not be used and may be removed in the future.
+// Use [ValidationScheme.IsValidLabelName] instead.
+func (ln LabelName) IsValid() bool {
+	return NameValidationScheme.IsValidLabelName(string(ln))
+}
+
+// IsValidLegacy returns true iff name matches the pattern of LabelNameRE for
+// legacy names. It does not use LabelNameRE for the check but a much faster
+// hardcoded implementation.
+//
+// Deprecated: This method should not be used and may be removed in the future.
+// Use [LegacyValidation.IsValidLabelName] instead.
+func (ln LabelName) IsValidLegacy() bool {
+	return LegacyValidation.IsValidLabelName(string(ln))
+}
+
 // UnmarshalYAML implements the yaml.Unmarshaler interface.
-func (ln *LabelName) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (ln *LabelName) UnmarshalYAML(unmarshal func(any) error) error {
 	var s string
 	if err := unmarshal(&s); err != nil {
 		return err
 	}
-	if !LabelNameRE.MatchString(s) {
+	if !LabelName(s).IsValid() {
 		return fmt.Errorf("%q is not a valid label name", s)
 	}
 	*ln = LabelName(s)
@@ -106,7 +142,7 @@ func (ln *LabelName) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &s); err != nil {
 		return err
 	}
-	if !LabelNameRE.MatchString(s) {
+	if !LabelName(s).IsValid() {
 		return fmt.Errorf("%q is not a valid label name", s)
 	}
 	*ln = LabelName(s)
@@ -139,6 +175,11 @@ func (l LabelNames) String() string {
 // A LabelValue is an associated value for a LabelName.
 type LabelValue string
 
+// IsValid returns true iff the string is a valid UTF-8.
+func (lv LabelValue) IsValid() bool {
+	return utf8.ValidString(string(lv))
+}
+
 // LabelValues is a sortable LabelValue slice. It implements sort.Interface.
 type LabelValues []LabelValue
 
@@ -147,7 +188,7 @@ func (l LabelValues) Len() int {
 }
 
 func (l LabelValues) Less(i, j int) bool {
-	return sort.StringsAreSorted([]string{string(l[i]), string(l[j])})
+	return string(l[i]) < string(l[j])
 }
 
 func (l LabelValues) Swap(i, j int) {

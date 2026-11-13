@@ -20,11 +20,10 @@ import (
 	"errors"
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/klog/v2"
+	api "k8s.io/kubernetes/pkg/apis/core"
 	"k8s.io/kubernetes/pkg/registry/core/service/allocator"
-	"k8s.io/kubernetes/pkg/util/net"
-
-	"github.com/golang/glog"
 )
 
 // Interface manages the allocation of ports out of a range. Interface
@@ -33,6 +32,10 @@ type Interface interface {
 	Allocate(int) error
 	AllocateNext() (int, error)
 	Release(int) error
+	ForEach(func(int))
+	Has(int) bool
+	Destroy()
+	EnableMetrics()
 }
 
 var (
@@ -53,33 +56,64 @@ type PortAllocator struct {
 	portRange net.PortRange
 
 	alloc allocator.Interface
+
+	// metrics is a metrics recorder that can be disabled
+	metrics metricsRecorderInterface
 }
 
 // PortAllocator implements Interface and Snapshottable
 var _ Interface = &PortAllocator{}
 
-// NewPortAllocatorCustom creates a PortAllocator over a net.PortRange, calling allocatorFactory to construct the backing store.
-func NewPortAllocatorCustom(pr net.PortRange, allocatorFactory allocator.AllocatorFactory) *PortAllocator {
+// New creates a PortAllocator over a net.PortRange, calling allocatorFactory to construct the backing store.
+func New(pr net.PortRange, allocatorFactory allocator.AllocatorWithOffsetFactory) (*PortAllocator, error) {
 	max := pr.Size
 	rangeSpec := pr.String()
 
 	a := &PortAllocator{
 		portRange: pr,
+		metrics:   &emptyMetricsRecorder{},
 	}
-	a.alloc = allocatorFactory(max, rangeSpec)
-	return a
+
+	var err error
+	a.alloc, err = allocatorFactory(max, rangeSpec, calculateRangeOffset(pr))
+	if err != nil {
+		return nil, err
+	}
+
+	return a, err
 }
 
-// Helper that wraps NewAllocatorCIDRRange, for creating a range backed by an in-memory store.
-func NewPortAllocator(pr net.PortRange) *PortAllocator {
-	return NewPortAllocatorCustom(pr, func(max int, rangeSpec string) allocator.Interface {
-		return allocator.NewAllocationMap(max, rangeSpec)
+// NewInMemory creates an in-memory allocator.
+func NewInMemory(pr net.PortRange) (*PortAllocator, error) {
+	return New(pr, func(max int, rangeSpec string, offset int) (allocator.Interface, error) {
+		return allocator.NewAllocationMapWithOffset(max, rangeSpec, offset), nil
 	})
+}
+
+// NewFromSnapshot allocates a PortAllocator and initializes it from a snapshot.
+func NewFromSnapshot(snap *api.RangeAllocation) (*PortAllocator, error) {
+	pr, err := net.ParsePortRange(snap.Range)
+	if err != nil {
+		return nil, err
+	}
+	r, err := NewInMemory(*pr)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.Restore(*pr, snap.Data); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // Free returns the count of port left in the range.
 func (r *PortAllocator) Free() int {
 	return r.alloc.Free()
+}
+
+// Used returns the count of ports used in the range.
+func (r *PortAllocator) Used() int {
+	return r.portRange.Size - r.alloc.Free()
 }
 
 // Allocate attempts to reserve the provided port. ErrNotInRange or
@@ -89,6 +123,9 @@ func (r *PortAllocator) Free() int {
 func (r *PortAllocator) Allocate(port int) error {
 	ok, offset := r.contains(port)
 	if !ok {
+		// update metrics
+		r.metrics.incrementAllocationErrors("static")
+
 		// include valid port range in error
 		validPorts := r.portRange.String()
 		return &ErrNotInRange{validPorts}
@@ -96,11 +133,21 @@ func (r *PortAllocator) Allocate(port int) error {
 
 	allocated, err := r.alloc.Allocate(offset)
 	if err != nil {
+		// update metrics
+		r.metrics.incrementAllocationErrors("static")
 		return err
 	}
 	if !allocated {
+		// update metrics
+		r.metrics.incrementAllocationErrors("static")
 		return ErrAllocated
 	}
+
+	// update metrics
+	r.metrics.incrementAllocations("static")
+	r.metrics.setAllocated(r.Used())
+	r.metrics.setAvailable(r.Free())
+
 	return nil
 }
 
@@ -109,12 +156,27 @@ func (r *PortAllocator) Allocate(port int) error {
 func (r *PortAllocator) AllocateNext() (int, error) {
 	offset, ok, err := r.alloc.AllocateNext()
 	if err != nil {
+		r.metrics.incrementAllocationErrors("dynamic")
 		return 0, err
 	}
 	if !ok {
+		r.metrics.incrementAllocationErrors("dynamic")
 		return 0, ErrFull
 	}
+
+	// update metrics
+	r.metrics.incrementAllocations("dynamic")
+	r.metrics.setAllocated(r.Used())
+	r.metrics.setAvailable(r.Free())
+
 	return r.portRange.Base + offset, nil
+}
+
+// ForEach calls the provided function for each allocated port.
+func (r *PortAllocator) ForEach(fn func(int)) {
+	r.alloc.ForEach(func(offset int) {
+		fn(r.portRange.Base + offset)
+	})
 }
 
 // Release releases the port back to the pool. Releasing an
@@ -123,11 +185,17 @@ func (r *PortAllocator) AllocateNext() (int, error) {
 func (r *PortAllocator) Release(port int) error {
 	ok, offset := r.contains(port)
 	if !ok {
-		glog.Warningf("port is not in the range when release it. port: %v", port)
+		klog.Warningf("port is not in the range when release it. port: %v", port)
 		return nil
 	}
 
-	return r.alloc.Release(offset)
+	err := r.alloc.Release(offset)
+	if err == nil {
+		// update metrics
+		r.metrics.setAllocated(r.Used())
+		r.metrics.setAvailable(r.Free())
+	}
+	return err
 }
 
 // Has returns true if the provided port is already allocated and a call
@@ -175,4 +243,43 @@ func (r *PortAllocator) contains(port int) (bool, int) {
 
 	offset := port - r.portRange.Base
 	return true, offset
+}
+
+// Destroy shuts down internal allocator.
+func (r *PortAllocator) Destroy() {
+	r.alloc.Destroy()
+}
+
+// EnableMetrics enables metrics recording.
+func (r *PortAllocator) EnableMetrics() {
+	registerMetrics()
+	r.metrics = &metricsRecorder{}
+}
+
+// calculateRangeOffset estimates the offset used on the range for statically allocation based on
+// the following formula `min(max($min, rangeSize/$step), $max)`, described as ~never less than
+// $min or more than $max, with a graduated step function between them~. The function returns 0
+// if any of the parameters is invalid.
+func calculateRangeOffset(pr net.PortRange) int {
+	// default values for min(max($min, rangeSize/$step), $max)
+	const (
+		min  = 16
+		max  = 128
+		step = 32
+	)
+
+	rangeSize := pr.Size
+	// offset should always be smaller than the range size
+	if rangeSize <= min {
+		return 0
+	}
+
+	offset := rangeSize / step
+	if offset < min {
+		return min
+	}
+	if offset > max {
+		return max
+	}
+	return int(offset)
 }

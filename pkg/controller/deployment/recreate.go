@@ -17,75 +17,62 @@ limitations under the License.
 package deployment
 
 import (
-	"fmt"
-
-	"k8s.io/kubernetes/pkg/apis/extensions"
-	unversionedclient "k8s.io/kubernetes/pkg/client/unversioned"
+	"context"
+	apps "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/kubernetes/pkg/controller"
-	"k8s.io/kubernetes/pkg/util/wait"
+	"k8s.io/kubernetes/pkg/controller/deployment/util"
 )
 
 // rolloutRecreate implements the logic for recreating a replica set.
-func (dc *DeploymentController) rolloutRecreate(deployment *extensions.Deployment) error {
-	// Don't create a new RS if not already existed, so that we avoid scaling up before scaling down
-	newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(deployment, false)
+func (dc *DeploymentController) rolloutRecreate(ctx context.Context, d *apps.Deployment, rsList []*apps.ReplicaSet, podMap map[types.UID][]*v1.Pod) error {
+	// Don't create a new RS if not already existed, so that we avoid scaling up before scaling down.
+	newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, false)
 	if err != nil {
 		return err
 	}
 	allRSs := append(oldRSs, newRS)
 	activeOldRSs := controller.FilterActiveReplicaSets(oldRSs)
 
-	// scale down old replica sets
-	scaledDown, err := dc.scaleDownOldReplicaSetsForRecreate(activeOldRSs, deployment)
-	if err != nil {
-		return err
-	}
-	if scaledDown {
-		// Update DeploymentStatus
-		return dc.updateDeploymentStatus(allRSs, newRS, deployment)
+	// scale down old replica sets.
+	scaledDown, err := dc.scaleDownOldReplicaSetsForRecreate(ctx, activeOldRSs, d)
+	// Old pods must be gone before the new RS is scaled up.
+	if err != nil || scaledDown || oldPodsRunning(newRS, oldRSs, podMap) {
+		return dc.syncRolloutStatusAfter(ctx, err, allRSs, newRS, d)
 	}
 
-	// Wait for all old replica set to scale down to zero.
-	if err := dc.waitForInactiveReplicaSets(activeOldRSs); err != nil {
-		return err
-	}
-
-	// If we need to create a new RS, create it now
-	// TODO: Create a new RS without re-listing all RSs.
+	// If we need to create a new RS, create it now.
 	if newRS == nil {
-		newRS, oldRSs, err = dc.getAllReplicaSetsAndSyncRevision(deployment, true)
+		newRS, oldRSs, err = dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, true)
 		if err != nil {
 			return err
 		}
 		allRSs = append(oldRSs, newRS)
 	}
 
-	// scale up new replica set
-	scaledUp, err := dc.scaleUpNewReplicaSetForRecreate(newRS, deployment)
-	if err != nil {
-		return err
-	}
-	if scaledUp {
-		// Update DeploymentStatus
-		return dc.updateDeploymentStatus(allRSs, newRS, deployment)
+	// scale up new replica set.
+	_, err = dc.scaleUpNewReplicaSetForRecreate(ctx, newRS, d)
+	if err == nil && util.DeploymentComplete(d, &d.Status) {
+		if err := dc.cleanupDeployment(ctx, oldRSs, d); err != nil {
+			return err
+		}
 	}
 
-	dc.cleanupDeployment(oldRSs, deployment)
-
-	// Sync deployment status
-	return dc.syncDeploymentStatus(allRSs, newRS, deployment)
+	// Sync deployment status.
+	return dc.syncRolloutStatusAfter(ctx, err, allRSs, newRS, d)
 }
 
-// scaleDownOldReplicaSetsForRecreate scales down old replica sets when deployment strategy is "Recreate"
-func (dc *DeploymentController) scaleDownOldReplicaSetsForRecreate(oldRSs []*extensions.ReplicaSet, deployment *extensions.Deployment) (bool, error) {
+// scaleDownOldReplicaSetsForRecreate scales down old replica sets when deployment strategy is "Recreate".
+func (dc *DeploymentController) scaleDownOldReplicaSetsForRecreate(ctx context.Context, oldRSs []*apps.ReplicaSet, deployment *apps.Deployment) (bool, error) {
 	scaled := false
 	for i := range oldRSs {
 		rs := oldRSs[i]
 		// Scaling not required.
-		if rs.Spec.Replicas == 0 {
+		if *(rs.Spec.Replicas) == 0 {
 			continue
 		}
-		scaledRS, updatedRS, err := dc.scaleReplicaSetAndRecordEvent(rs, 0, deployment)
+		scaledRS, updatedRS, err := dc.scaleReplicaSet(ctx, rs, 0, deployment, false)
 		if err != nil {
 			return false, err
 		}
@@ -97,42 +84,38 @@ func (dc *DeploymentController) scaleDownOldReplicaSetsForRecreate(oldRSs []*ext
 	return scaled, nil
 }
 
-// waitForInactiveReplicaSets will wait until all passed replica sets are inactive and have been noticed
-// by the replica set controller.
-func (dc *DeploymentController) waitForInactiveReplicaSets(oldRSs []*extensions.ReplicaSet) error {
-	for i := range oldRSs {
-		rs := oldRSs[i]
-		desiredGeneration := rs.Generation
-		observedGeneration := rs.Status.ObservedGeneration
-		specReplicas := rs.Spec.Replicas
-		statusReplicas := rs.Status.Replicas
-
-		if err := wait.ExponentialBackoff(unversionedclient.DefaultRetry, func() (bool, error) {
-			replicaSet, err := dc.rsLister.ReplicaSets(rs.Namespace).Get(rs.Name)
-			if err != nil {
-				return false, err
+// oldPodsRunning returns whether there are old pods running or any of the old ReplicaSets thinks that it runs pods.
+func oldPodsRunning(newRS *apps.ReplicaSet, oldRSs []*apps.ReplicaSet, podMap map[types.UID][]*v1.Pod) bool {
+	if oldPods := util.GetActualReplicaCountForReplicaSets(oldRSs); oldPods > 0 {
+		return true
+	}
+	for rsUID, podList := range podMap {
+		// If the pods belong to the new ReplicaSet, ignore.
+		if newRS != nil && newRS.UID == rsUID {
+			continue
+		}
+		for _, pod := range podList {
+			switch pod.Status.Phase {
+			case v1.PodFailed, v1.PodSucceeded:
+				// Don't count pods in terminal state.
+				continue
+			case v1.PodUnknown:
+				// v1.PodUnknown is a deprecated status.
+				// This logic is kept for backward compatibility.
+				// This used to happen in situation like when the node is temporarily disconnected from the cluster.
+				// If we can't be sure that the pod is not running, we have to count it.
+				return true
+			default:
+				// Pod is not in terminal phase.
+				return true
 			}
-
-			specReplicas = replicaSet.Spec.Replicas
-			statusReplicas = replicaSet.Status.Replicas
-			observedGeneration = replicaSet.Status.ObservedGeneration
-
-			// TODO: We also need to wait for terminating replicas to actually terminate.
-			// See https://github.com/kubernetes/kubernetes/issues/32567
-			return observedGeneration >= desiredGeneration && replicaSet.Spec.Replicas == 0 && replicaSet.Status.Replicas == 0, nil
-		}); err != nil {
-			if err == wait.ErrWaitTimeout {
-				err = fmt.Errorf("replica set %q never became inactive: synced=%t, spec.replicas=%d, status.replicas=%d",
-					rs.Name, observedGeneration >= desiredGeneration, specReplicas, statusReplicas)
-			}
-			return err
 		}
 	}
-	return nil
+	return false
 }
 
-// scaleUpNewReplicaSetForRecreate scales up new replica set when deployment strategy is "Recreate"
-func (dc *DeploymentController) scaleUpNewReplicaSetForRecreate(newRS *extensions.ReplicaSet, deployment *extensions.Deployment) (bool, error) {
-	scaled, _, err := dc.scaleReplicaSetAndRecordEvent(newRS, deployment.Spec.Replicas, deployment)
+// scaleUpNewReplicaSetForRecreate scales up new replica set when deployment strategy is "Recreate".
+func (dc *DeploymentController) scaleUpNewReplicaSetForRecreate(ctx context.Context, newRS *apps.ReplicaSet, deployment *apps.Deployment) (bool, error) {
+	scaled, _, err := dc.scaleReplicaSet(ctx, newRS, *(deployment.Spec.Replicas), deployment, false)
 	return scaled, err
 }

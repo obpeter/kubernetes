@@ -18,9 +18,11 @@ package allocator
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 	"math/rand"
 	"sync"
+	"time"
 )
 
 // AllocationBitmap is a contiguous block of resources that can be allocated atomically.
@@ -33,8 +35,8 @@ import (
 //
 // TODO: use RLE and compact the allocator to minimize space.
 type AllocationBitmap struct {
-	// strategy is the strategy for choosing the next available item out of the range
-	strategy allocateStrategy
+	// strategy carries the details of how to choose the next available item out of the range
+	strategy bitAllocator
 	// max is the maximum size of the usable items in the range
 	max int
 	// rangeSpec is the range specifier, matching RangeAllocation.Range
@@ -52,30 +54,33 @@ type AllocationBitmap struct {
 var _ Interface = &AllocationBitmap{}
 var _ Snapshottable = &AllocationBitmap{}
 
-// allocateStrategy is a search strategy in the allocation map for a valid item.
-type allocateStrategy func(allocated *big.Int, max, count int) (int, bool)
+// bitAllocator represents a search strategy in the allocation map for a valid item.
+type bitAllocator interface {
+	AllocateBit(allocated *big.Int, max, count int) (int, bool)
+}
 
 // NewAllocationMap creates an allocation bitmap using the random scan strategy.
 func NewAllocationMap(max int, rangeSpec string) *AllocationBitmap {
-	a := AllocationBitmap{
-		strategy:  randomScanStrategy,
-		allocated: big.NewInt(0),
-		count:     0,
-		max:       max,
-		rangeSpec: rangeSpec,
-	}
-	return &a
+	return NewAllocationMapWithOffset(max, rangeSpec, 0)
 }
 
-// NewContiguousAllocationMap creates an allocation bitmap using the contiguous scan strategy.
-func NewContiguousAllocationMap(max int, rangeSpec string) *AllocationBitmap {
+// NewAllocationMapWithOffset creates an allocation bitmap using a random scan strategy that
+// allows to pass an offset that divides the allocation bitmap in two blocks.
+// The first block of values will not be used for random value assigned by the AllocateNext()
+// method until the second block of values has been exhausted.
+// The offset value must be always smaller than the bitmap size.
+func NewAllocationMapWithOffset(max int, rangeSpec string, offset int) *AllocationBitmap {
 	a := AllocationBitmap{
-		strategy:  contiguousScanStrategy,
+		strategy: randomScanStrategyWithOffset{
+			rand:   rand.New(rand.NewSource(time.Now().UnixNano())),
+			offset: offset,
+		},
 		allocated: big.NewInt(0),
 		count:     0,
 		max:       max,
 		rangeSpec: rangeSpec,
 	}
+
 	return &a
 }
 
@@ -85,6 +90,10 @@ func (r *AllocationBitmap) Allocate(offset int) (bool, error) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
+	// max is the maximum size of the usable items in the range
+	if offset < 0 || offset >= r.max {
+		return false, fmt.Errorf("offset %d out of range [0,%d]", offset, r.max)
+	}
 	if r.allocated.Bit(offset) == 1 {
 		return false, nil
 	}
@@ -99,7 +108,7 @@ func (r *AllocationBitmap) AllocateNext() (int, bool, error) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
-	next, ok := r.strategy(r.allocated, r.max, r.count)
+	next, ok := r.strategy.AllocateBit(r.allocated, r.max, r.count)
 	if !ok {
 		return 0, false, nil
 	}
@@ -122,6 +131,33 @@ func (r *AllocationBitmap) Release(offset int) error {
 	r.allocated = r.allocated.SetBit(r.allocated, offset, 0)
 	r.count--
 	return nil
+}
+
+const (
+	// Find the size of a big.Word in bytes.
+	notZero   = uint64(^big.Word(0))
+	wordPower = (notZero>>8)&1 + (notZero>>16)&1 + (notZero>>32)&1
+	wordSize  = 1 << wordPower
+)
+
+// ForEach calls the provided function for each allocated bit.  The
+// AllocationBitmap may not be modified while this loop is running.
+func (r *AllocationBitmap) ForEach(fn func(int)) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+
+	words := r.allocated.Bits()
+	for wordIdx, word := range words {
+		bit := 0
+		for word > 0 {
+			if (word & 1) != 0 {
+				fn((wordIdx * wordSize * 8) + bit)
+				word = word &^ 1
+			}
+			bit++
+			word = word >> 1
+		}
+	}
 }
 
 // Has returns true if the provided item is already allocated and a call
@@ -163,14 +199,22 @@ func (r *AllocationBitmap) Restore(rangeSpec string, data []byte) error {
 	return nil
 }
 
+// Destroy cleans up everything on shutdown.
+func (r *AllocationBitmap) Destroy() {
+}
+
 // randomScanStrategy chooses a random address from the provided big.Int, and then
 // scans forward looking for the next available address (it will wrap the range if
 // necessary).
-func randomScanStrategy(allocated *big.Int, max, count int) (int, bool) {
+type randomScanStrategy struct {
+	rand *rand.Rand
+}
+
+func (rss randomScanStrategy) AllocateBit(allocated *big.Int, max, count int) (int, bool) {
 	if count >= max {
 		return 0, false
 	}
-	offset := rand.Intn(max)
+	offset := rss.rand.Intn(max)
 	for i := 0; i < max; i++ {
 		at := (offset + i) % max
 		if allocated.Bit(at) == 0 {
@@ -180,15 +224,41 @@ func randomScanStrategy(allocated *big.Int, max, count int) (int, bool) {
 	return 0, false
 }
 
-// contiguousScanStrategy tries to allocate starting at 0 and filling in any gaps
-func contiguousScanStrategy(allocated *big.Int, max, count int) (int, bool) {
+var _ bitAllocator = randomScanStrategy{}
+
+// randomScanStrategyWithOffset choose a random address from the provided big.Int and then scans
+// forward looking for the next available address. The big.Int range is subdivided so it will try
+// to allocate first from the reserved upper range of addresses (it will wrap the upper subrange if necessary).
+// If there is no free address it will try to allocate one from the lower range too.
+type randomScanStrategyWithOffset struct {
+	rand   *rand.Rand
+	offset int
+}
+
+func (rss randomScanStrategyWithOffset) AllocateBit(allocated *big.Int, max, count int) (int, bool) {
 	if count >= max {
 		return 0, false
 	}
-	for i := 0; i < max; i++ {
-		if allocated.Bit(i) == 0 {
-			return i, true
+	// size of the upper subrange, prioritized for random allocation
+	subrangeMax := max - rss.offset
+	// try to get a value from the upper range [rss.reserved, max]
+	start := rss.rand.Intn(subrangeMax)
+	for i := 0; i < subrangeMax; i++ {
+		at := rss.offset + ((start + i) % subrangeMax)
+		if allocated.Bit(at) == 0 {
+			return at, true
+		}
+	}
+
+	start = rss.rand.Intn(rss.offset)
+	// subrange full, try to get the value from the first block before giving up.
+	for i := 0; i < rss.offset; i++ {
+		at := (start + i) % rss.offset
+		if allocated.Bit(at) == 0 {
+			return at, true
 		}
 	}
 	return 0, false
 }
+
+var _ bitAllocator = randomScanStrategyWithOffset{}

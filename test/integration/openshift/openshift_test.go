@@ -19,23 +19,27 @@ package openshift
 import (
 	"testing"
 
-	"k8s.io/kubernetes/pkg/genericapiserver"
-	"k8s.io/kubernetes/pkg/master"
+	genericapiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/kubernetes/pkg/controlplane"
+	controlplaneapiserver "k8s.io/kubernetes/pkg/controlplane/apiserver"
 )
 
-// This test references methods that OpenShift uses to customize the master on startup, that
-// are not referenced directly by a master.
-func TestMasterExportsSymbols(t *testing.T) {
-	_ = &master.Config{
-		GenericConfig: &genericapiserver.Config{
-			EnableSwaggerSupport: false,
+// This test references methods that OpenShift uses to customize the apiserver on startup, that
+// are not referenced directly by an instance.
+func TestApiserverExportsSymbols(t *testing.T) {
+	_ = &controlplane.Config{
+		ControlPlane: controlplaneapiserver.Config{
+			Generic: &genericapiserver.Config{
+				EnableMetrics: true,
+			},
+			Extra: controlplaneapiserver.Extra{
+				EnableLogsSupport: false,
+			},
 		},
-		EnableCoreControllers: false,
-		EnableUISupport:       false,
-		EnableLogsSupport:     false,
 	}
-	m := &master.Master{
-		GenericAPIServer: &genericapiserver.GenericAPIServer{},
+	_ = &controlplane.Instance{
+		ControlPlane: &controlplaneapiserver.Server{
+			GenericAPIServer: &genericapiserver.GenericAPIServer{},
+		},
 	}
-	_ = (m).NewBootstrapController(master.EndpointReconcilerConfig{})
 }

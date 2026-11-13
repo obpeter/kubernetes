@@ -18,23 +18,22 @@ package flexvolume
 
 import (
 	"bytes"
-	"encoding/base64"
 	"fmt"
 	"os"
-	"path"
+	"path/filepath"
+	goruntime "runtime"
 	"testing"
 	"text/template"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/exec"
-	"k8s.io/kubernetes/pkg/util/mount"
-	utiltesting "k8s.io/kubernetes/pkg/util/testing"
+	"k8s.io/api/core/v1"
+	utiltesting "k8s.io/client-go/util/testing"
+	utilfs "k8s.io/kubernetes/pkg/util/filesystem"
 	"k8s.io/kubernetes/pkg/volume"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
+	"k8s.io/utils/exec"
 )
 
-const execScriptTempl1 = `#!/bin/bash
+const execScriptTempl1 = `#!/usr/bin/env bash
 if [ "$1" == "init" -a $# -eq 1 ]; then
   echo -n '{
     "status": "Success"
@@ -54,21 +53,22 @@ elif [ "$1" == "detach" -a $# -eq 2 ]; then
     "status": "Success"
   }'
   exit 0
-elif [ "$1" == "mount" -a $# -eq 4 ]; then
+elif [ "$1" == "getvolumename" -a $# -eq 4 ]; then
   echo -n '{
-    "status": "Not supported"
+    "status": "Success",
+    "volume": "fakevolume"
   }'
   exit 0
-elif [ "$1" == "unmount" -a $# -eq 2 ]; then
+elif [ "$1" == "isattached" -a $# -eq 2 ]; then
   echo -n '{
-    "status": "Not supported"
+    "status": "Success",
+    "attached": true
   }'
   exit 0
 fi
 
 echo -n '{
-  "status": "Failure",
-  "reason": "Invalid usage"
+  "status": "Not supported"
 }'
 exit 1
 
@@ -76,62 +76,43 @@ exit 1
 echo -n $@ &> {{.OutputFile}}
 `
 
-const execScriptTempl2 = `#!/bin/bash
-if [ "$1" == "init" -a $# -eq 1 ]; then
-  echo -n '{
-    "status": "Success"
-  }'
-  exit 0
-fi
+// NOTE: Typically, Windows requires file extensions for executable files. If a file does not
+// have a file extension, Windows will check if there is a file with the given name + one of the
+// extensions from $env:PATHEXT (in order) and run that file with that extension.
+// For example, if we have the file C:\\foo.bat, we can run C:\\foo.
+// For these tests, .bat was chosen since it's one of the default values in $env.PATHEXT. .ps1 is
+// not in that list, but it might be useful for flexvolumes to be able to handle powershell scripts.
+// There's no argument count variable in batch. Instead, we can check that the n-th argument
+// is an empty string.
+const execScriptTemplBat = `
+@echo off
 
-if [ "$1" == "attach" -a $# -eq 2 ]; then
-  echo -n '{
-    "status": "Not supported"
-  }'
-  exit 0
-elif [ "$1" == "detach" -a $# -eq 2 ]; then
-  echo -n '{
-    "status": "Not supported"
-  }'
-  exit 0
-elif [ "$1" == "mount" -a $# -eq 4 ]; then
-  PATH=$2
-  /bin/mkdir -p $PATH
-  if [ $? -ne 0 ]; then
-    echo -n '{
-      "status": "Failure",
-      "reason": "Failed to create $PATH"
-    }'
-    exit 1
-  fi
-  echo -n '{
-    "status": "Success"
-  }'
-  exit 0
-elif [ "$1" == "unmount" -a $# -eq 2 ]; then
-  PATH=$2
-  /bin/rm -r $PATH
-  if [ $? -ne 0 ]; then
-    echo -n '{
-      "status": "Failure",
-      "reason": "Failed to cleanup $PATH"
-    }'
-    exit 1
-  fi
-  echo -n '{
-    "status": "Success"
-  }'
-  exit 0
-fi
+if "%1"=="init" if "%2"=="" (
+    echo {"status": "Success"}
+    exit 0
+)
+if "%1"=="attach" if "%3"=="" (
+    echo {"device": "{{.DevicePath}}", "status": "Success"}
+    exit 0
+)
 
-echo -n '{
-  "status": "Failure",
-  "reason": "Invalid usage"
-}'
+if "%1"=="detach" if "%3"=="" (
+    echo {"status": "Success"}
+    exit 0
+)
+
+if "%1"=="getvolumename" if "%5"=="" (
+    echo {"status": "Success", "volume": "fakevolume"}
+    exit 0
+)
+
+if "%1"=="isattached" if "%3"=="" (
+    echo {"status": "Success", "attached": true}
+    exit 0
+)
+
+echo {"status": "Not supported"}
 exit 1
-
-# Direct the arguments to a file to be tested against later
-echo -n $@ &> {{.OutputFile}}
 `
 
 func installPluginUnderTest(t *testing.T, vendorName, plugName, tmpDir string, execScriptTempl string, execTemplateData *map[string]interface{}) {
@@ -139,12 +120,15 @@ func installPluginUnderTest(t *testing.T, vendorName, plugName, tmpDir string, e
 	if vendorName != "" {
 		vendoredName = fmt.Sprintf("%s~%s", vendorName, plugName)
 	}
-	pluginDir := path.Join(tmpDir, vendoredName)
+	pluginDir := filepath.Join(tmpDir, vendoredName)
 	err := os.MkdirAll(pluginDir, 0777)
 	if err != nil {
 		t.Errorf("Failed to create plugin: %v", err)
 	}
-	pluginExec := path.Join(pluginDir, plugName)
+	pluginExec := filepath.Join(pluginDir, plugName)
+	if goruntime.GOOS == "windows" {
+		pluginExec = pluginExec + ".bat"
+	}
 	f, err := os.Create(pluginExec)
 	if err != nil {
 		t.Errorf("Failed to install plugin")
@@ -156,7 +140,7 @@ func installPluginUnderTest(t *testing.T, vendorName, plugName, tmpDir string, e
 	if execTemplateData == nil {
 		execTemplateData = &map[string]interface{}{
 			"DevicePath": "/dev/sdx",
-			"OutputFile": path.Join(pluginDir, plugName+".out"),
+			"OutputFile": filepath.Join(pluginDir, plugName+".out"),
 		}
 	}
 
@@ -181,22 +165,29 @@ func TestCanSupport(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	installPluginUnderTest(t, "kubernetes.io", "fakeAttacher", tmpDir, execScriptTempl1, nil)
-	plugMgr.InitPlugins(ProbeVolumePlugins(tmpDir), volumetest.NewFakeVolumeHost("fake", nil, nil, "" /* rootContext */))
+	runner := exec.New()
+	execScriptTempl := execScriptTempl1
+	if goruntime.GOOS == "windows" {
+		execScriptTempl = execScriptTemplBat
+	}
+	installPluginUnderTest(t, "kubernetes.io", "fakeAttacher", tmpDir, execScriptTempl, nil)
+	if err := plugMgr.InitPlugins(nil, GetDynamicPluginProberWithoutWatcher(tmpDir, runner), volumetest.NewFakeVolumeHost(t, "fake", nil, nil)); err != nil {
+		t.Fatalf("Could not initialize plugins: %v", err)
+	}
 	plugin, err := plugMgr.FindPluginByName("kubernetes.io/fakeAttacher")
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatalf("Can't find the plugin by name")
 	}
 	if plugin.GetPluginName() != "kubernetes.io/fakeAttacher" {
 		t.Errorf("Wrong name: %s", plugin.GetPluginName())
 	}
-	if !plugin.CanSupport(&volume.Spec{Volume: &api.Volume{VolumeSource: api.VolumeSource{FlexVolume: &api.FlexVolumeSource{Driver: "kubernetes.io/fakeAttacher"}}}}) {
+	if !plugin.CanSupport(&volume.Spec{Volume: &v1.Volume{VolumeSource: v1.VolumeSource{FlexVolume: &v1.FlexVolumeSource{Driver: "kubernetes.io/fakeAttacher"}}}}) {
 		t.Errorf("Expected true")
 	}
-	if !plugin.CanSupport(&volume.Spec{PersistentVolume: &api.PersistentVolume{Spec: api.PersistentVolumeSpec{PersistentVolumeSource: api.PersistentVolumeSource{FlexVolume: &api.FlexVolumeSource{Driver: "kubernetes.io/fakeAttacher"}}}}}) {
+	if !plugin.CanSupport(&volume.Spec{PersistentVolume: &v1.PersistentVolume{Spec: v1.PersistentVolumeSpec{PersistentVolumeSource: v1.PersistentVolumeSource{FlexVolume: &v1.FlexPersistentVolumeSource{Driver: "kubernetes.io/fakeAttacher"}}}}}) {
 		t.Errorf("Expected true")
 	}
-	if plugin.CanSupport(&volume.Spec{Volume: &api.Volume{VolumeSource: api.VolumeSource{}}}) {
+	if plugin.CanSupport(&volume.Spec{Volume: &v1.Volume{VolumeSource: v1.VolumeSource{}}}) {
 		t.Errorf("Expected false")
 	}
 }
@@ -209,209 +200,30 @@ func TestGetAccessModes(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	plugMgr := volume.VolumePluginMgr{}
-	installPluginUnderTest(t, "kubernetes.io", "fakeAttacher", tmpDir, execScriptTempl1, nil)
-	plugMgr.InitPlugins(ProbeVolumePlugins(tmpDir), volumetest.NewFakeVolumeHost(tmpDir, nil, nil, "" /* rootContext */))
-
+	runner := exec.New()
+	execScriptTempl := execScriptTempl1
+	if goruntime.GOOS == "windows" {
+		execScriptTempl = execScriptTemplBat
+	}
+	installPluginUnderTest(t, "kubernetes.io", "fakeAttacher", tmpDir, execScriptTempl, nil)
+	if err := plugMgr.InitPlugins(nil, GetDynamicPluginProberWithoutWatcher(tmpDir, runner), volumetest.NewFakeVolumeHost(t, tmpDir, nil, nil)); err != nil {
+		t.Fatalf("Could not initialize plugins: %v", err)
+	}
 	plugin, err := plugMgr.FindPersistentPluginByName("kubernetes.io/fakeAttacher")
 	if err != nil {
 		t.Fatalf("Can't find the plugin by name")
 	}
-	if !contains(plugin.GetAccessModes(), api.ReadWriteOnce) || !contains(plugin.GetAccessModes(), api.ReadOnlyMany) {
-		t.Errorf("Expected two AccessModeTypes:  %s and %s", api.ReadWriteOnce, api.ReadOnlyMany)
+	if !volumetest.ContainsAccessMode(plugin.GetAccessModes(), v1.ReadWriteOnce) || !volumetest.ContainsAccessMode(plugin.GetAccessModes(), v1.ReadOnlyMany) {
+		t.Errorf("Expected two AccessModeTypes:  %s and %s", v1.ReadWriteOnce, v1.ReadOnlyMany)
 	}
 }
 
-func contains(modes []api.PersistentVolumeAccessMode, mode api.PersistentVolumeAccessMode) bool {
-	for _, m := range modes {
-		if m == mode {
-			return true
-		}
+func GetDynamicPluginProberWithoutWatcher(pluginDir string, runner exec.Interface) volume.DynamicPluginProber {
+	return &flexVolumeProber{
+		pluginDir: pluginDir,
+		watcher:   newFakeWatcher(),
+		factory:   pluginFactory{},
+		runner:    runner,
+		fs:        &utilfs.DefaultFs{},
 	}
-	return false
-}
-
-func doTestPluginAttachDetach(t *testing.T, spec *volume.Spec, tmpDir string) {
-	plugMgr := volume.VolumePluginMgr{}
-	installPluginUnderTest(t, "kubernetes.io", "fakeAttacher", tmpDir, execScriptTempl1, nil)
-	plugMgr.InitPlugins(ProbeVolumePlugins(tmpDir), volumetest.NewFakeVolumeHost(tmpDir, nil, nil, "" /* rootContext */))
-	plugin, err := plugMgr.FindPluginByName("kubernetes.io/fakeAttacher")
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-	fake := &mount.FakeMounter{}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: types.UID("poduid")}}
-	secretMap := make(map[string]string)
-	secretMap["flexsecret"] = base64.StdEncoding.EncodeToString([]byte("foo"))
-	mounter, err := plugin.(*flexVolumePlugin).newMounterInternal(spec, pod, &flexVolumeUtil{}, fake, exec.New(), secretMap)
-	volumePath := mounter.GetPath()
-	if err != nil {
-		t.Errorf("Failed to make a new Mounter: %v", err)
-	}
-	if mounter == nil {
-		t.Errorf("Got a nil Mounter")
-	}
-	path := mounter.GetPath()
-	expectedPath := fmt.Sprintf("%s/pods/poduid/volumes/kubernetes.io~fakeAttacher/vol1", tmpDir)
-	if path != expectedPath {
-		t.Errorf("Unexpected path, expected %q, got: %q", expectedPath, path)
-	}
-	if err := mounter.SetUp(nil); err != nil {
-		t.Errorf("Expected success, got: %v", err)
-	}
-	if _, err := os.Stat(volumePath); err != nil {
-		if os.IsNotExist(err) {
-			t.Errorf("SetUp() failed, volume path not created: %s", volumePath)
-		} else {
-			t.Errorf("SetUp() failed: %v", err)
-		}
-	}
-	t.Logf("Setup successful")
-	if mounter.(*flexVolumeMounter).readOnly {
-		t.Errorf("The volume source should not be read-only and it is.")
-	}
-
-	if len(fake.Log) != 1 {
-		t.Errorf("Mount was not called exactly one time. It was called %d times.", len(fake.Log))
-	} else {
-		if fake.Log[0].Action != mount.FakeActionMount {
-			t.Errorf("Unexpected mounter action: %#v", fake.Log[0])
-		}
-	}
-	fake.ResetLog()
-
-	unmounter, err := plugin.(*flexVolumePlugin).newUnmounterInternal("vol1", types.UID("poduid"), &flexVolumeUtil{}, fake, exec.New())
-	if err != nil {
-		t.Errorf("Failed to make a new Unmounter: %v", err)
-	}
-	if unmounter == nil {
-		t.Errorf("Got a nil Unmounter")
-	}
-	if err := unmounter.TearDown(); err != nil {
-		t.Errorf("Expected success, got: %v", err)
-	}
-	if _, err := os.Stat(volumePath); err == nil {
-		t.Errorf("TearDown() failed, volume path still exists: %s", volumePath)
-	} else if !os.IsNotExist(err) {
-		t.Errorf("SetUp() failed: %v", err)
-	}
-	if len(fake.Log) != 1 {
-		t.Errorf("Unmount was not called exactly one time. It was called %d times.", len(fake.Log))
-	} else {
-		if fake.Log[0].Action != mount.FakeActionUnmount {
-			t.Errorf("Unexpected mounter action: %#v", fake.Log[0])
-		}
-	}
-
-	fake.ResetLog()
-}
-
-func doTestPluginMountUnmount(t *testing.T, spec *volume.Spec, tmpDir string) {
-	tmpDir, err := utiltesting.MkTmpdir("flexvolume_test")
-	if err != nil {
-		t.Fatalf("error creating temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	plugMgr := volume.VolumePluginMgr{}
-	installPluginUnderTest(t, "kubernetes.io", "fakeMounter", tmpDir, execScriptTempl2, nil)
-	plugMgr.InitPlugins(ProbeVolumePlugins(tmpDir), volumetest.NewFakeVolumeHost(tmpDir, nil, nil, "" /* rootContext */))
-	plugin, err := plugMgr.FindPluginByName("kubernetes.io/fakeMounter")
-	if err != nil {
-		t.Errorf("Can't find the plugin by name")
-	}
-	fake := &mount.FakeMounter{}
-	pod := &api.Pod{ObjectMeta: api.ObjectMeta{UID: types.UID("poduid")}}
-	// Use nil secret to test for nil secret case.
-	mounter, err := plugin.(*flexVolumePlugin).newMounterInternal(spec, pod, &flexVolumeUtil{}, fake, exec.New(), nil)
-	volumePath := mounter.GetPath()
-	if err != nil {
-		t.Errorf("Failed to make a new Mounter: %v", err)
-	}
-	if mounter == nil {
-		t.Errorf("Got a nil Mounter")
-	}
-	path := mounter.GetPath()
-	expectedPath := fmt.Sprintf("%s/pods/poduid/volumes/kubernetes.io~fakeMounter/vol1", tmpDir)
-	if path != expectedPath {
-		t.Errorf("Unexpected path, expected %q, got: %q", expectedPath, path)
-	}
-	if err := mounter.SetUp(nil); err != nil {
-		t.Errorf("Expected success, got: %v", err)
-	}
-	if _, err := os.Stat(volumePath); err != nil {
-		if os.IsNotExist(err) {
-			t.Errorf("SetUp() failed, volume path not created: %s", volumePath)
-		} else {
-			t.Errorf("SetUp() failed: %v", err)
-		}
-	}
-	t.Logf("Setup successful")
-	if mounter.(*flexVolumeMounter).readOnly {
-		t.Errorf("The volume source should not be read-only and it is.")
-	}
-
-	unmounter, err := plugin.(*flexVolumePlugin).newUnmounterInternal("vol1", types.UID("poduid"), &flexVolumeUtil{}, fake, exec.New())
-	if err != nil {
-		t.Errorf("Failed to make a new Unmounter: %v", err)
-	}
-	if unmounter == nil {
-		t.Errorf("Got a nil Unmounter")
-	}
-	if err := unmounter.TearDown(); err != nil {
-		t.Errorf("Expected success, got: %v", err)
-	}
-	if _, err := os.Stat(volumePath); err == nil {
-		t.Errorf("TearDown() failed, volume path still exists: %s", volumePath)
-	} else if !os.IsNotExist(err) {
-		t.Errorf("SetUp() failed: %v", err)
-	}
-}
-
-func TestPluginVolumeAttacher(t *testing.T) {
-	tmpDir, err := utiltesting.MkTmpdir("flexvolume_test")
-	if err != nil {
-		t.Fatalf("error creating temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	vol := &api.Volume{
-		Name:         "vol1",
-		VolumeSource: api.VolumeSource{FlexVolume: &api.FlexVolumeSource{Driver: "kubernetes.io/fakeAttacher", ReadOnly: false}},
-	}
-	doTestPluginAttachDetach(t, volume.NewSpecFromVolume(vol), tmpDir)
-}
-
-func TestPluginVolumeMounter(t *testing.T) {
-	tmpDir, err := utiltesting.MkTmpdir("flexvolume_test")
-	if err != nil {
-		t.Fatalf("error creating temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	vol := &api.Volume{
-		Name:         "vol1",
-		VolumeSource: api.VolumeSource{FlexVolume: &api.FlexVolumeSource{Driver: "kubernetes.io/fakeMounter", ReadOnly: false}},
-	}
-	doTestPluginMountUnmount(t, volume.NewSpecFromVolume(vol), tmpDir)
-}
-
-func TestPluginPersistentVolume(t *testing.T) {
-	tmpDir, err := utiltesting.MkTmpdir("flexvolume_test")
-	if err != nil {
-		t.Fatalf("error creating temp dir: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	vol := &api.PersistentVolume{
-		ObjectMeta: api.ObjectMeta{
-			Name: "vol1",
-		},
-		Spec: api.PersistentVolumeSpec{
-			PersistentVolumeSource: api.PersistentVolumeSource{
-				FlexVolume: &api.FlexVolumeSource{Driver: "kubernetes.io/fakeAttacher", ReadOnly: false},
-			},
-		},
-	}
-
-	doTestPluginAttachDetach(t, volume.NewSpecFromPersistentVolume(vol, false), tmpDir)
 }

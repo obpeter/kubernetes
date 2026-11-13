@@ -17,31 +17,33 @@ limitations under the License.
 package testing
 
 import (
+	"context"
 	"sync"
 
-	"k8s.io/kubernetes/pkg/api"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/util/sets"
 )
 
 type FakeMirrorClient struct {
 	mirrorPodLock sync.RWMutex
 	// Note that a real mirror manager does not store the mirror pods in
 	// itself. This fake manager does this to track calls.
-	mirrorPods   sets.String
+	mirrorPods   sets.Set[string]
 	createCounts map[string]int
 	deleteCounts map[string]int
 }
 
 func NewFakeMirrorClient() *FakeMirrorClient {
 	m := FakeMirrorClient{}
-	m.mirrorPods = sets.NewString()
+	m.mirrorPods = sets.New[string]()
 	m.createCounts = make(map[string]int)
 	m.deleteCounts = make(map[string]int)
 	return &m
 }
 
-func (fmc *FakeMirrorClient) CreateMirrorPod(pod *api.Pod) error {
+func (fmc *FakeMirrorClient) CreateMirrorPod(_ context.Context, pod *v1.Pod) error {
 	fmc.mirrorPodLock.Lock()
 	defer fmc.mirrorPodLock.Unlock()
 	podFullName := kubecontainer.GetPodFullName(pod)
@@ -50,12 +52,13 @@ func (fmc *FakeMirrorClient) CreateMirrorPod(pod *api.Pod) error {
 	return nil
 }
 
-func (fmc *FakeMirrorClient) DeleteMirrorPod(podFullName string) error {
+// TODO (Robert Krawitz): Implement UID checking
+func (fmc *FakeMirrorClient) DeleteMirrorPod(_ context.Context, podFullName string, _ *types.UID) (bool, error) {
 	fmc.mirrorPodLock.Lock()
 	defer fmc.mirrorPodLock.Unlock()
 	fmc.mirrorPods.Delete(podFullName)
 	fmc.deleteCounts[podFullName]++
-	return nil
+	return true, nil
 }
 
 func (fmc *FakeMirrorClient) HasPod(podFullName string) bool {
@@ -73,7 +76,7 @@ func (fmc *FakeMirrorClient) NumOfPods() int {
 func (fmc *FakeMirrorClient) GetPods() []string {
 	fmc.mirrorPodLock.RLock()
 	defer fmc.mirrorPodLock.RUnlock()
-	return fmc.mirrorPods.List()
+	return sets.List(fmc.mirrorPods)
 }
 
 func (fmc *FakeMirrorClient) GetCounts(podFullName string) (int, int) {

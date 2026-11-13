@@ -14,253 +14,117 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e_node
+package e2enode
 
 import (
+	"context"
 	"fmt"
-	"path"
+	"os"
+	"path/filepath"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/kubernetes/pkg/kubelet/images"
-	"k8s.io/kubernetes/pkg/util/uuid"
+	"k8s.io/kubernetes/test/e2e/common/node"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
+	e2eregistry "k8s.io/kubernetes/test/e2e/framework/registry"
+	"k8s.io/kubernetes/test/e2e_node/services"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
 )
 
-const (
-	consistentCheckTimeout = time.Second * 5
-	retryTimeout           = time.Minute * 5
-	pollInterval           = time.Second * 1
-)
-
-var _ = framework.KubeDescribe("Container Runtime Conformance Test", func() {
+var _ = SIGDescribe("Container Runtime Conformance Test", func() {
 	f := framework.NewDefaultFramework("runtime-conformance")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged // custom registry pods need HostPorts
 
-	Describe("container runtime conformance blackbox test", func() {
-		Context("when starting a container that exits", func() {
-			It("it should run with the expected status [Conformance]", func() {
-				restartCountVolumeName := "restart-count"
-				restartCountVolumePath := "/restart-count"
-				testContainer := api.Container{
-					Image: "gcr.io/google_containers/busybox:1.24",
-					VolumeMounts: []api.VolumeMount{
-						{
-							MountPath: restartCountVolumePath,
-							Name:      restartCountVolumeName,
-						},
-					},
-				}
-				testVolumes := []api.Volume{
-					{
-						Name: restartCountVolumeName,
-						VolumeSource: api.VolumeSource{
-							EmptyDir: &api.EmptyDirVolumeSource{Medium: api.StorageMediumMemory},
-						},
-					},
-				}
-				testCases := []struct {
-					Name          string
-					RestartPolicy api.RestartPolicy
-					Phase         api.PodPhase
-					State         ContainerState
-					RestartCount  int32
-					Ready         bool
-				}{
-					{"terminate-cmd-rpa", api.RestartPolicyAlways, api.PodRunning, ContainerStateRunning, 2, true},
-					{"terminate-cmd-rpof", api.RestartPolicyOnFailure, api.PodSucceeded, ContainerStateTerminated, 1, false},
-					{"terminate-cmd-rpn", api.RestartPolicyNever, api.PodFailed, ContainerStateTerminated, 0, false},
-				}
-				for _, testCase := range testCases {
+	ginkgo.Describe("container runtime conformance blackbox test", func() {
 
-					// It failed at the 1st run, then succeeded at 2nd run, then run forever
-					cmdScripts := `
-f=%s
-count=$(echo 'hello' >> $f ; wc -l $f | awk {'print $1'})
-if [ $count -eq 1 ]; then
-	exit 1
-fi
-if [ $count -eq 2 ]; then
-	exit 0
-fi
-while true; do sleep 1; done
-`
-					tmpCmd := fmt.Sprintf(cmdScripts, path.Join(restartCountVolumePath, "restartCount"))
-					testContainer.Name = testCase.Name
-					testContainer.Command = []string{"sh", "-c", tmpCmd}
-					terminateContainer := ConformanceContainer{
-						PodClient:     f.PodClient(),
-						Container:     testContainer,
-						RestartPolicy: testCase.RestartPolicy,
-						Volumes:       testVolumes,
-						PodSecurityContext: &api.PodSecurityContext{
-							SELinuxOptions: &api.SELinuxOptions{
-								Level: "s0",
-							},
-						},
-					}
-					terminateContainer.Create()
-					defer terminateContainer.Delete()
-
-					By("it should get the expected 'RestartCount'")
-					Eventually(func() (int32, error) {
-						status, err := terminateContainer.GetStatus()
-						return status.RestartCount, err
-					}, retryTimeout, pollInterval).Should(Equal(testCase.RestartCount))
-
-					By("it should get the expected 'Phase'")
-					Eventually(terminateContainer.GetPhase, retryTimeout, pollInterval).Should(Equal(testCase.Phase))
-
-					By("it should get the expected 'Ready' condition")
-					Expect(terminateContainer.IsReady()).Should(Equal(testCase.Ready))
-
-					status, err := terminateContainer.GetStatus()
-					Expect(err).ShouldNot(HaveOccurred())
-
-					By("it should get the expected 'State'")
-					Expect(GetContainerState(status.State)).To(Equal(testCase.State))
-
-					By("it should be possible to delete [Conformance]")
-					Expect(terminateContainer.Delete()).To(Succeed())
-					Eventually(terminateContainer.Present, retryTimeout, pollInterval).Should(BeFalse())
-				}
-			})
-
-			It("should report termination message if TerminationMessagePath is set [Conformance]", func() {
-				name := "termination-message-container"
-				terminationMessage := "DONE"
-				terminationMessagePath := "/dev/termination-log"
-				priv := true
-				c := ConformanceContainer{
-					PodClient: f.PodClient(),
-					Container: api.Container{
-						Image:   "gcr.io/google_containers/busybox:1.24",
-						Name:    name,
-						Command: []string{"/bin/sh", "-c"},
-						Args:    []string{fmt.Sprintf("/bin/echo -n %s > %s", terminationMessage, terminationMessagePath)},
-						TerminationMessagePath: terminationMessagePath,
-						SecurityContext: &api.SecurityContext{
-							Privileged: &priv,
-						},
-					},
-					RestartPolicy: api.RestartPolicyNever,
-				}
-
-				By("create the container")
-				c.Create()
-				defer c.Delete()
-
-				By("wait for the container to succeed")
-				Eventually(c.GetPhase, retryTimeout, pollInterval).Should(Equal(api.PodSucceeded))
-
-				By("get the container status")
-				status, err := c.GetStatus()
-				Expect(err).NotTo(HaveOccurred())
-
-				By("the container should be terminated")
-				Expect(GetContainerState(status.State)).To(Equal(ContainerStateTerminated))
-
-				By("the termination message should be set")
-				Expect(status.State.Terminated.Message).Should(Equal(terminationMessage))
-
-				By("delete the container")
-				Expect(c.Delete()).To(Succeed())
-			})
-		})
-
-		Context("when running a container with a new image", func() {
-			// The service account only has pull permission
-			auth := `
-{
-	"auths": {
-		"https://gcr.io": {
-			"auth": "X2pzb25fa2V5OnsKICAidHlwZSI6ICJzZXJ2aWNlX2FjY291bnQiLAogICJwcm9qZWN0X2lkIjogImF1dGhlbnRpY2F0ZWQtaW1hZ2UtcHVsbGluZyIsCiAgInByaXZhdGVfa2V5X2lkIjogImI5ZjJhNjY0YWE5YjIwNDg0Y2MxNTg2MDYzZmVmZGExOTIyNGFjM2IiLAogICJwcml2YXRlX2tleSI6ICItLS0tLUJFR0lOIFBSSVZBVEUgS0VZLS0tLS1cbk1JSUV2UUlCQURBTkJna3Foa2lHOXcwQkFRRUZBQVNDQktjd2dnU2pBZ0VBQW9JQkFRQzdTSG5LVEVFaVlMamZcbkpmQVBHbUozd3JCY2VJNTBKS0xxS21GWE5RL3REWGJRK2g5YVl4aldJTDhEeDBKZTc0bVovS01uV2dYRjVLWlNcbm9BNktuSU85Yi9SY1NlV2VpSXRSekkzL1lYVitPNkNjcmpKSXl4anFWam5mVzJpM3NhMzd0OUE5VEZkbGZycm5cbjR6UkpiOWl4eU1YNGJMdHFGR3ZCMDNOSWl0QTNzVlo1ODhrb1FBZmgzSmhhQmVnTWorWjRSYko0aGVpQlFUMDNcbnZVbzViRWFQZVQ5RE16bHdzZWFQV2dydDZOME9VRGNBRTl4bGNJek11MjUzUG4vSzgySFpydEx4akd2UkhNVXhcbng0ZjhwSnhmQ3h4QlN3Z1NORit3OWpkbXR2b0wwRmE3ZGducFJlODZWRDY2ejNZenJqNHlLRXRqc2hLZHl5VWRcbkl5cVhoN1JSQWdNQkFBRUNnZ0VBT3pzZHdaeENVVlFUeEFka2wvSTVTRFVidi9NazRwaWZxYjJEa2FnbmhFcG9cbjFJajJsNGlWMTByOS9uenJnY2p5VlBBd3pZWk1JeDFBZVF0RDdoUzRHWmFweXZKWUc3NkZpWFpQUm9DVlB6b3VcbmZyOGRDaWFwbDV0enJDOWx2QXNHd29DTTdJWVRjZmNWdDdjRTEyRDNRS3NGNlo3QjJ6ZmdLS251WVBmK0NFNlRcbmNNMHkwaCtYRS9kMERvSERoVy96YU1yWEhqOFRvd2V1eXRrYmJzNGYvOUZqOVBuU2dET1lQd2xhbFZUcitGUWFcbkpSd1ZqVmxYcEZBUW14M0Jyd25rWnQzQ2lXV2lGM2QrSGk5RXRVYnRWclcxYjZnK1JRT0licWFtcis4YlJuZFhcbjZWZ3FCQWtKWjhSVnlkeFVQMGQxMUdqdU9QRHhCbkhCbmM0UW9rSXJFUUtCZ1FEMUNlaWN1ZGhXdGc0K2dTeGJcbnplanh0VjFONDFtZHVjQnpvMmp5b1dHbzNQVDh3ckJPL3lRRTM0cU9WSi9pZCs4SThoWjRvSWh1K0pBMDBzNmdcblRuSXErdi9kL1RFalk4MW5rWmlDa21SUFdiWHhhWXR4UjIxS1BYckxOTlFKS2ttOHRkeVh5UHFsOE1veUdmQ1dcbjJ2aVBKS05iNkhabnY5Q3lqZEo5ZzJMRG5RS0JnUUREcVN2eURtaGViOTIzSW96NGxlZ01SK205Z2xYVWdTS2dcbkVzZlllbVJmbU5XQitDN3ZhSXlVUm1ZNU55TXhmQlZXc3dXRldLYXhjK0krYnFzZmx6elZZdFpwMThNR2pzTURcbmZlZWZBWDZCWk1zVXQ3Qmw3WjlWSjg1bnRFZHFBQ0xwWitaLzN0SVJWdWdDV1pRMWhrbmxHa0dUMDI0SkVFKytcbk55SDFnM2QzUlFLQmdRQ1J2MXdKWkkwbVBsRklva0tGTkh1YTBUcDNLb1JTU1hzTURTVk9NK2xIckcxWHJtRjZcbkMwNGNTKzQ0N0dMUkxHOFVUaEpKbTRxckh0Ti9aK2dZOTYvMm1xYjRIakpORDM3TVhKQnZFYTN5ZUxTOHEvK1JcbjJGOU1LamRRaU5LWnhQcG84VzhOSlREWTVOa1BaZGh4a2pzSHdVNGRTNjZwMVRESUU0MGd0TFpaRFFLQmdGaldcbktyblFpTnEzOS9iNm5QOFJNVGJDUUFKbmR3anhTUU5kQTVmcW1rQTlhRk9HbCtqamsxQ1BWa0tNSWxLSmdEYkpcbk9heDl2OUc2Ui9NSTFIR1hmV3QxWU56VnRocjRIdHNyQTB0U3BsbWhwZ05XRTZWejZuQURqdGZQSnMyZUdqdlhcbmpQUnArdjhjY21MK3dTZzhQTGprM3ZsN2VlNXJsWWxNQndNdUdjUHhBb0dBZWRueGJXMVJMbVZubEFpSEx1L0xcbmxtZkF3RFdtRWlJMFVnK1BMbm9Pdk81dFE1ZDRXMS94RU44bFA0cWtzcGtmZk1Rbk5oNFNZR0VlQlQzMlpxQ1RcbkpSZ2YwWGpveXZ2dXA5eFhqTWtYcnBZL3ljMXpmcVRaQzBNTzkvMVVjMWJSR2RaMmR5M2xSNU5XYXA3T1h5Zk9cblBQcE5Gb1BUWGd2M3FDcW5sTEhyR3pNPVxuLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLVxuIiwKICAiY2xpZW50X2VtYWlsIjogImltYWdlLXB1bGxpbmdAYXV0aGVudGljYXRlZC1pbWFnZS1wdWxsaW5nLmlhbS5nc2VydmljZWFjY291bnQuY29tIiwKICAiY2xpZW50X2lkIjogIjExMzc5NzkxNDUzMDA3MzI3ODcxMiIsCiAgImF1dGhfdXJpIjogImh0dHBzOi8vYWNjb3VudHMuZ29vZ2xlLmNvbS9vL29hdXRoMi9hdXRoIiwKICAidG9rZW5fdXJpIjogImh0dHBzOi8vYWNjb3VudHMuZ29vZ2xlLmNvbS9vL29hdXRoMi90b2tlbiIsCiAgImF1dGhfcHJvdmlkZXJfeDUwOV9jZXJ0X3VybCI6ICJodHRwczovL3d3dy5nb29nbGVhcGlzLmNvbS9vYXV0aDIvdjEvY2VydHMiLAogICJjbGllbnRfeDUwOV9jZXJ0X3VybCI6ICJodHRwczovL3d3dy5nb29nbGVhcGlzLmNvbS9yb2JvdC92MS9tZXRhZGF0YS94NTA5L2ltYWdlLXB1bGxpbmclNDBhdXRoZW50aWNhdGVkLWltYWdlLXB1bGxpbmcuaWFtLmdzZXJ2aWNlYWNjb3VudC5jb20iCn0=",
-			"email": "image-pulling@authenticated-image-pulling.iam.gserviceaccount.com"
-		}
-	}
-}`
-			secret := &api.Secret{
-				Data: map[string][]byte{api.DockerConfigJsonKey: []byte(auth)},
-				Type: api.SecretTypeDockerConfigJson,
-			}
-			// The following images are not added into NodeImageWhiteList, because this test is
+		ginkgo.Context("when running a container with a new image", func() {
+			// The following images are not added into NodePrePullImageList, because this test is
 			// testing image pulling, these images don't need to be prepulled. The ImagePullPolicy
-			// is api.PullAlways, so it won't be blocked by framework image white list check.
+			// is v1.PullAlways, so it won't be blocked by framework image pre-pull list check.
 			for _, testCase := range []struct {
-				description string
-				image       string
-				secret      bool
-				phase       api.PodPhase
-				waiting     bool
+				description  string
+				image        string
+				setupRegisty bool
+				phase        v1.PodPhase
+				waiting      bool
 			}{
 				{
-					description: "should not be able to pull image from invalid registry",
-					image:       "invalid.com/invalid/alpine:3.1",
-					phase:       api.PodPending,
-					waiting:     true,
-				},
-				{
-					description: "should not be able to pull non-existing image from gcr.io",
-					image:       "gcr.io/google_containers/invalid-image:invalid-tag",
-					phase:       api.PodPending,
-					waiting:     true,
-				},
-				{
-					description: "should be able to pull image from gcr.io",
-					image:       "gcr.io/google_containers/alpine-with-bash:1.0",
-					phase:       api.PodRunning,
-					waiting:     false,
-				},
-				{
-					description: "should be able to pull image from docker hub",
-					image:       "alpine:3.1",
-					phase:       api.PodRunning,
-					waiting:     false,
-				},
-				{
-					description: "should not be able to pull from private registry without secret",
-					image:       "gcr.io/authenticated-image-pulling/alpine:3.1",
-					phase:       api.PodPending,
-					waiting:     true,
-				},
-				{
-					description: "should be able to pull from private registry with secret",
-					image:       "gcr.io/authenticated-image-pulling/alpine:3.1",
-					secret:      true,
-					phase:       api.PodRunning,
-					waiting:     false,
+					description:  "should be able to pull from private registry with credential provider",
+					image:        "pause:testing",
+					setupRegisty: true,
+					phase:        v1.PodRunning,
+					waiting:      false,
 				},
 			} {
-				testCase := testCase
-				It(testCase.description, func() {
+				var registryAddress string
+				var podNodes []string
+				ginkgo.BeforeEach(func(ctx context.Context) {
+					var err error
+					if !testCase.setupRegisty {
+						return
+					}
+
+					registryAddress, podNodes, err = e2eregistry.SetupRegistry(ctx, f, true)
+					framework.ExpectNoError(err)
+					// we need to wait for the registry to be removed and so we need to delete the whole NS ourselves
+					ginkgo.DeferCleanup(func(ctx context.Context) {
+						f.DeleteNamespace(ctx, f.Namespace.Name)
+					})
+				})
+
+				f.It(testCase.description+"", f.WithNodeConformance(), f.WithDisruptive(), f.WithSerial(), func(ctx context.Context) {
 					name := "image-pull-test"
-					command := []string{"/bin/sh", "-c", "while true; do sleep 1; done"}
-					container := ConformanceContainer{
-						PodClient: f.PodClient(),
-						Container: api.Container{
-							Name:    name,
-							Image:   testCase.image,
-							Command: command,
+					container := node.ConformanceContainer{
+						PodClient: e2epod.NewPodClient(f),
+						Container: v1.Container{
+							Name:  name,
+							Image: registryAddress + "/" + testCase.image,
 							// PullAlways makes sure that the image will always be pulled even if it is present before the test.
-							ImagePullPolicy: api.PullAlways,
+							ImagePullPolicy: v1.PullAlways,
 						},
-						RestartPolicy: api.RestartPolicyNever,
+						RestartPolicy: v1.RestartPolicyNever,
 					}
-					if testCase.secret {
-						secret.Name = "image-pull-secret-" + string(uuid.NewUUID())
-						By("create image pull secret")
-						_, err := f.Client.Secrets(f.Namespace.Name).Create(secret)
-						Expect(err).NotTo(HaveOccurred())
-						defer f.Client.Secrets(f.Namespace.Name).Delete(secret.Name)
-						container.ImagePullSecrets = []string{secret.Name}
+					if testCase.setupRegisty {
+						container.NodeName = podNodes[0]
 					}
+
+					auth := e2eregistry.User1DockerSecret(registryAddress).Data[v1.DockerConfigJsonKey]
+					configFile := filepath.Join(services.KubeletRootDirectory, "config.json")
+
+					// the kubelet would cache the config for 5 minutes, let's restart instead
+					restartKubelet(context.Background(), true)
+
+					err := os.WriteFile(configFile, []byte(auth), 0644)
+					framework.ExpectNoError(err)
+					ginkgo.DeferCleanup(func(ctx context.Context) {
+						imageManagerDir := filepath.Join(services.KubeletRootDirectory, "image_manager")
+
+						// restart the kubelet
+						withStoppedKubelet(ctx, f, false, func() {
+							framework.ExpectNoError(os.Remove(configFile))
+							framework.ExpectNoError(os.RemoveAll(imageManagerDir))
+						})
+						framework.ExpectNoError(wait.PollUntilContextTimeout(ctx, 5*time.Second, 2*time.Minute, true, func(_ context.Context) (bool, error) {
+							if _, err := os.Stat(imageManagerDir); err != nil {
+								f.Logf("waiting for %q to appear: %v", imageManagerDir, err)
+								return false, nil
+							}
+							return true, nil
+						}),
+							"directory %q never reappeared", imageManagerDir,
+						)
+					})
+
 					// checkContainerStatus checks whether the container status matches expectation.
-					checkContainerStatus := func() error {
-						status, err := container.GetStatus()
+					checkContainerStatus := func(ctx context.Context) error {
+						status, err := container.GetStatus(ctx)
 						if err != nil {
-							return fmt.Errorf("failed to get container status: %v", err)
+							return fmt.Errorf("failed to get container status: %w", err)
 						}
 						// We need to check container state first. The default pod status is pending, If we check
 						// pod phase first, and the expected pod phase is Pending, the container status may not
@@ -269,13 +133,13 @@ while true; do sleep 1; done
 						if !testCase.waiting {
 							if status.State.Running == nil {
 								return fmt.Errorf("expected container state: Running, got: %q",
-									GetContainerState(status.State))
+									node.GetContainerState(status.State))
 							}
 						}
 						if testCase.waiting {
 							if status.State.Waiting == nil {
 								return fmt.Errorf("expected container state: Waiting, got: %q",
-									GetContainerState(status.State))
+									node.GetContainerState(status.State))
 							}
 							reason := status.State.Waiting.Reason
 							if reason != images.ErrImagePull.Error() &&
@@ -284,38 +148,37 @@ while true; do sleep 1; done
 							}
 						}
 						// Check pod phase
-						phase, err := container.GetPhase()
+						phase, err := container.GetPhase(ctx)
 						if err != nil {
-							return fmt.Errorf("failed to get pod phase: %v", err)
+							return fmt.Errorf("failed to get pod phase: %w", err)
 						}
 						if phase != testCase.phase {
 							return fmt.Errorf("expected pod phase: %q, got: %q", testCase.phase, phase)
 						}
 						return nil
 					}
-					// The image registry is not stable, which sometimes causes the test to fail. Add retry mechanism to make this
-					// less flaky.
-					const flakeRetry = 3
-					for i := 1; i <= flakeRetry; i++ {
-						var err error
-						By("create the container")
-						container.Create()
-						By("check the container status")
-						for start := time.Now(); time.Since(start) < retryTimeout; time.Sleep(pollInterval) {
-							if err = checkContainerStatus(); err == nil {
-								break
-							}
+
+					ginkgo.By("create the container")
+					container.Create(ctx)
+					ginkgo.DeferCleanup(func(ctx context.Context) {
+						ginkgo.By("delete the conformance container")
+						if err := container.Delete(ctx); err != nil {
+							framework.Logf("error deleting a conformance container: %v", err)
 						}
-						By("delete the container")
-						container.Delete()
-						if err == nil {
-							break
+					})
+
+					ginkgo.By("check the container status")
+					var latestErr error
+					err = wait.PollUntilContextTimeout(ctx, node.ContainerStatusPollInterval, node.ContainerStatusRetryTimeout, true, func(ctx context.Context) (bool, error) {
+						if latestErr = checkContainerStatus(ctx); latestErr != nil {
+							return false, nil
 						}
-						if i < flakeRetry {
-							framework.Logf("No.%d attempt failed: %v, retrying...", i, err)
-						} else {
-							framework.Failf("All %d attempts failed: %v", flakeRetry, err)
-						}
+						return true, nil
+					})
+					if err != nil {
+						credsContent, readErr := os.ReadFile(configFile)
+						framework.Logf("credentials read error: %v; credentials used:\n%v", readErr, credsContent)
+						framework.Failf("Failed to read container status: %v; last observed error from wait loop: %v", err, latestErr)
 					}
 				})
 			}

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -18,56 +18,90 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/../..
 source "${KUBE_ROOT}/hack/lib/init.sh"
-# Lists of API Versions of each groups that should be tested, groups are
-# separated by comma, lists are separated by semicolon. e.g.,
-# "v1,compute/v1alpha1,experimental/v1alpha2;v1,compute/v2,experimental/v1alpha3"
-# TODO: It's going to be:
-# KUBE_TEST_API_VERSIONS=${KUBE_TEST_API_VERSIONS:-"v1,extensions/v1beta1"}
-# FIXME: due to current implementation of a test client (see: pkg/api/testapi/testapi.go)
-# ONLY the last version is tested in each group.
-ALL_VERSIONS_CSV=$(IFS=',';echo "${KUBE_AVAILABLE_GROUP_VERSIONS[*]// /,}";IFS=$)
-KUBE_TEST_API_VERSIONS="${KUBE_TEST_API_VERSIONS:-${ALL_VERSIONS_CSV}}"
 
-# Give integration tests longer to run
-# TODO: allow a larger value to be passed in
-#KUBE_TIMEOUT=${KUBE_TIMEOUT:--timeout 240s}
-KUBE_TIMEOUT="-timeout 600s"
+kube::golang::setup_env
+kube::util::require-jq
+
+set -x
+
+# start the cache mutation detector by default so that cache mutators will be found
+KUBE_CACHE_MUTATION_DETECTOR="${KUBE_CACHE_MUTATION_DETECTOR:-true}"
+export KUBE_CACHE_MUTATION_DETECTOR
+
+# default set to "false" to avoid panic on decode errors.
+# integration tests intentionally insert data that cannot be decoded.
+KUBE_PANIC_WATCH_DECODE_ERROR="${KUBE_PANIC_WATCH_DECODE_ERROR:-false}"
+export KUBE_PANIC_WATCH_DECODE_ERROR
+
 KUBE_INTEGRATION_TEST_MAX_CONCURRENCY=${KUBE_INTEGRATION_TEST_MAX_CONCURRENCY:-"-1"}
+if [[ ${KUBE_INTEGRATION_TEST_MAX_CONCURRENCY} -gt 0 ]]; then
+  GOMAXPROCS=${KUBE_INTEGRATION_TEST_MAX_CONCURRENCY}
+  export GOMAXPROCS
+  kube::log::status "Setting parallelism to ${GOMAXPROCS}"
+fi
+
+# Give integration tests longer to run by default.
+KUBE_TIMEOUT=${KUBE_TIMEOUT:--timeout=600s}
 LOG_LEVEL=${LOG_LEVEL:-2}
 KUBE_TEST_ARGS=${KUBE_TEST_ARGS:-}
+# Default glog module settings.
+KUBE_TEST_VMODULE=${KUBE_TEST_VMODULE:-""}
 
-kube::test::find_integration_test_dirs() {
+set +x
+
+kube::test::find_integration_test_pkgs() {
   (
-    cd ${KUBE_ROOT}
-    find test/integration/${1-} -name '*_test.go' -print0 \
-      | xargs -0n1 dirname \
-      | uniq \
-      | sort -u
+    cd "${KUBE_ROOT}"
+
+    # Get a list of all the modules in this workspace.
+    local -a workspace_module_patterns
+    kube::util::read-array workspace_module_patterns < <(
+        go list -m -json | jq -r '.Dir' \
+        | while read -r D; do
+            SUB="${D}/test/integration";
+            test -d "${SUB}" && echo "${SUB}/...";
+        done)
+
+    # Get a list of all packages which have test files.
+    go list -find \
+        -f '{{if or (gt (len .TestGoFiles) 0) (gt (len .XTestGoFiles) 0)}}{{.ImportPath}}{{end}}' \
+        "${workspace_module_patterns[@]}"
   )
 }
 
+CLEANUP_REQUIRED=
 cleanup() {
+  if [[ -z "${CLEANUP_REQUIRED}" ]]; then
+    return
+  fi
   kube::log::status "Cleaning up etcd"
   kube::etcd::cleanup
+  CLEANUP_REQUIRED=
   kube::log::status "Integration test cleanup complete"
 }
 
 runTests() {
   kube::log::status "Starting etcd instance"
+  CLEANUP_REQUIRED=1
   kube::etcd::start
+  # shellcheck disable=SC2034
+  local ETCD_SCRAPE_PID # Set in kube::etcd::start_scraping, used in cleanup
+  kube::etcd::start_scraping
   kube::log::status "Running integration test cases"
 
-  # TODO: Re-enable race detection when we switch to a thread-safe etcd client
-  # KUBE_RACE="-race"
-  make -C "${KUBE_ROOT}" test \
-      WHAT="$(kube::test::find_integration_test_dirs ${2-} | paste -sd' ' -) $(echo ${@:3})" \
-      KUBE_GOFLAGS="${KUBE_GOFLAGS:-} ${SHORT:--short=true} -tags 'integration no-docker'" \
-      KUBE_TEST_ARGS="${KUBE_TEST_ARGS:-} --vmodule=garbage*collector*=6 --alsologtostderr=true" \
-      KUBE_RACE="" \
+  # shellcheck disable=SC2034
+  # KUBE_RACE and MAKEFLAGS are used in the downstream make, and we set them to
+  # empty here to ensure that we aren't unintentionally consuming them from the
+  # previous make invocation.
+  KUBE_TEST_ARGS="${SHORT:--short=true} --vmodule=${KUBE_TEST_VMODULE} ${KUBE_TEST_ARGS}" \
+      WHAT="${WHAT:-$(kube::test::find_integration_test_pkgs | paste -sd' ' -)}" \
+      GOFLAGS="${GOFLAGS:-}" \
       KUBE_TIMEOUT="${KUBE_TIMEOUT}" \
-      KUBE_TEST_API_VERSIONS="$1"
+      KUBE_RACE=${KUBE_RACE:-""} \
+      MAKEFLAGS="" \
+      make -C "${KUBE_ROOT}" test
 
   cleanup
 }
@@ -76,7 +110,8 @@ checkEtcdOnPath() {
   kube::log::status "Checking etcd is on PATH"
   which etcd && return
   kube::log::status "Cannot find etcd, cannot run integration tests."
-  kube::log::status "Please see docs/devel/testing.md for instructions."
+  kube::log::status "Please see https://git.k8s.io/community/contributors/devel/sig-testing/integration-tests.md#install-etcd-dependency for instructions."
+  kube::log::usage "You can use 'hack/install-etcd.sh' to install a copy in third_party/."
   return 1
 }
 
@@ -85,25 +120,4 @@ checkEtcdOnPath
 # Run cleanup to stop etcd on interrupt or other kill signal.
 trap cleanup EXIT
 
-# If a test case is specified, just run once with v1 API version and exit
-if [[ -n "${KUBE_TEST_ARGS}" ]]; then
-  runTests v1
-fi
-
-# Pass arguments that begin with "-" and move them to goflags.
-what_flags=()
-for arg in "$@"; do
-  if [[ "${arg}" == -* ]]; then
-    what_flags+=("${arg}")
-  fi
-done
-if [[ "${#what_flags[@]}" -eq 0 ]]; then
-  what_flags=''
-fi
-
-
-# Convert the CSV to an array of API versions to test
-IFS=';' read -a apiVersions <<< "${KUBE_TEST_API_VERSIONS}"
-for apiVersion in "${apiVersions[@]}"; do
-  runTests "${apiVersion}" "${1-}" "${what_flags[@]}"
-done
+runTests

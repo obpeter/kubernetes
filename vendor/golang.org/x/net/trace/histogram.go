@@ -12,6 +12,7 @@ import (
 	"html/template"
 	"log"
 	"math"
+	"sync"
 
 	"golang.org/x/net/internal/timeseries"
 )
@@ -31,7 +32,7 @@ type histogram struct {
 	valueCount   int64   // number of values recorded for single value
 }
 
-// AddMeasurement records a value measurement observation to the histogram.
+// addMeasurement records a value measurement observation to the histogram.
 func (h *histogram) addMeasurement(value int64) {
 	// TODO: assert invariant
 	h.sum += value
@@ -69,10 +70,7 @@ func log2(i int64) int {
 }
 
 func getBucket(i int64) (index int) {
-	index = log2(i) - 1
-	if index < 0 {
-		index = 0
-	}
+	index = max(log2(i)-1, 0)
 	if index >= bucketCount {
 		index = bucketCount - 1
 	}
@@ -320,15 +318,20 @@ func (h *histogram) newData() *data {
 
 func (h *histogram) html() template.HTML {
 	buf := new(bytes.Buffer)
-	if err := distTmpl.Execute(buf, h.newData()); err != nil {
+	if err := distTmpl().Execute(buf, h.newData()); err != nil {
 		buf.Reset()
 		log.Printf("net/trace: couldn't execute template: %v", err)
 	}
 	return template.HTML(buf.String())
 }
 
-// Input: data
-var distTmpl = template.Must(template.New("distTmpl").Parse(`
+var distTmplCache *template.Template
+var distTmplOnce sync.Once
+
+func distTmpl() *template.Template {
+	distTmplOnce.Do(func() {
+		// Input: data
+		distTmplCache = template.Must(template.New("distTmpl").Parse(`
 <table>
 <tr>
     <td style="padding:0.25em">Count: {{.Count}}</td>
@@ -354,3 +357,6 @@ var distTmpl = template.Must(template.New("distTmpl").Parse(`
 {{end}}
 </table>
 `))
+	})
+	return distTmplCache
+}

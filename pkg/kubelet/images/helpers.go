@@ -17,11 +17,13 @@ limitations under the License.
 package images
 
 import (
+	"context"
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
+	"k8s.io/client-go/util/flowcontrol"
+	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
+	"k8s.io/kubernetes/pkg/credentialprovider"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/util/flowcontrol"
 )
 
 // throttleImagePulling wraps kubecontainer.ImageService to throttle image
@@ -42,9 +44,9 @@ type throttledImageService struct {
 	limiter flowcontrol.RateLimiter
 }
 
-func (ts throttledImageService) PullImage(image kubecontainer.ImageSpec, secrets []api.Secret) error {
+func (ts throttledImageService) PullImage(ctx context.Context, image kubecontainer.ImageSpec, credentials []credentialprovider.TrackedAuthConfig, podSandboxConfig *runtimeapi.PodSandboxConfig) (string, *credentialprovider.TrackedAuthConfig, error) {
 	if ts.limiter.TryAccept() {
-		return ts.ImageService.PullImage(image, secrets)
+		return ts.ImageService.PullImage(ctx, image, credentials, podSandboxConfig)
 	}
-	return fmt.Errorf("pull QPS exceeded.")
+	return "", nil, fmt.Errorf("pull QPS exceeded")
 }

@@ -19,17 +19,19 @@ package proxy
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/types"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/kubernetes/pkg/proxy/config"
 )
 
-// ProxyProvider is the interface provided by proxier implementations.
-type ProxyProvider interface {
-	// OnServiceUpdate manages the active set of service proxies.
-	// Active service proxies are reinitialized if found in the update set or
-	// removed if missing from the update set.
-	OnServiceUpdate(services []api.Service)
-	// Sync immediately synchronizes the ProxyProvider's current state to iptables.
+// Provider is the interface provided by proxier implementations.
+type Provider interface {
+	config.EndpointSliceHandler
+	config.ServiceHandler
+	config.NodeTopologyHandler
+	config.ServiceCIDRHandler
+
+	// Sync immediately synchronizes the Provider's current state to proxy rules.
 	Sync()
 	// SyncLoop runs periodic work.
 	// This is expected to run as a goroutine or as the main loop of the app.
@@ -38,12 +40,26 @@ type ProxyProvider interface {
 }
 
 // ServicePortName carries a namespace + name + portname.  This is the unique
-// identfier for a load-balanced service.
+// identifier for a load-balanced service.
 type ServicePortName struct {
 	types.NamespacedName
-	Port string
+	Port     string
+	Protocol v1.Protocol
 }
 
 func (spn ServicePortName) String() string {
-	return fmt.Sprintf("%s:%s", spn.NamespacedName.String(), spn.Port)
+	return fmt.Sprintf("%s%s", spn.NamespacedName.String(), fmtPortName(spn.Port))
+}
+
+func fmtPortName(in string) string {
+	if in == "" {
+		return ""
+	}
+	return fmt.Sprintf(":%s", in)
+}
+
+// ServiceEndpoint is used to identify a service and one of its endpoint pair.
+type ServiceEndpoint struct {
+	Endpoint        string
+	ServicePortName ServicePortName
 }

@@ -14,6 +14,7 @@
 package model
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -35,8 +36,9 @@ type Alert struct {
 	Annotations LabelSet `json:"annotations"`
 
 	// The known time range for this alert. Both ends are optional.
-	StartsAt time.Time `json:"startsAt,omitempty"`
-	EndsAt   time.Time `json:"endsAt,omitempty"`
+	StartsAt     time.Time `json:"startsAt,omitempty"`
+	EndsAt       time.Time `json:"endsAt,omitempty"`
+	GeneratorURL string    `json:"generatorURL"`
 }
 
 // Name returns the name of the alert. It is equivalent to the "alertname" label.
@@ -60,18 +62,49 @@ func (a *Alert) String() string {
 
 // Resolved returns true iff the activity interval ended in the past.
 func (a *Alert) Resolved() bool {
+	return a.ResolvedAt(time.Now())
+}
+
+// ResolvedAt returns true iff the activity interval ended before
+// the given timestamp.
+func (a *Alert) ResolvedAt(ts time.Time) bool {
 	if a.EndsAt.IsZero() {
 		return false
 	}
-	return !a.EndsAt.After(time.Now())
+	return !a.EndsAt.After(ts)
 }
 
 // Status returns the status of the alert.
 func (a *Alert) Status() AlertStatus {
-	if a.Resolved() {
+	return a.StatusAt(time.Now())
+}
+
+// StatusAt returns the status of the alert at the given timestamp.
+func (a *Alert) StatusAt(ts time.Time) AlertStatus {
+	if a.ResolvedAt(ts) {
 		return AlertResolved
 	}
 	return AlertFiring
+}
+
+// Validate checks whether the alert data is inconsistent.
+func (a *Alert) Validate() error {
+	if a.StartsAt.IsZero() {
+		return errors.New("start time missing")
+	}
+	if !a.EndsAt.IsZero() && a.EndsAt.Before(a.StartsAt) {
+		return errors.New("start time must be before end time")
+	}
+	if err := a.Labels.Validate(); err != nil {
+		return fmt.Errorf("invalid label set: %w", err)
+	}
+	if len(a.Labels) == 0 {
+		return errors.New("at least one label pair required")
+	}
+	if err := a.Annotations.Validate(); err != nil {
+		return fmt.Errorf("invalid annotations: %w", err)
+	}
+	return nil
 }
 
 // Alert is a list of alerts that can be sorted in chronological order.
@@ -100,9 +133,29 @@ func (as Alerts) HasFiring() bool {
 	return false
 }
 
+// HasFiringAt returns true iff one of the alerts is not resolved
+// at the time ts.
+func (as Alerts) HasFiringAt(ts time.Time) bool {
+	for _, a := range as {
+		if !a.ResolvedAt(ts) {
+			return true
+		}
+	}
+	return false
+}
+
 // Status returns StatusFiring iff at least one of the alerts is firing.
 func (as Alerts) Status() AlertStatus {
 	if as.HasFiring() {
+		return AlertFiring
+	}
+	return AlertResolved
+}
+
+// StatusAt returns StatusFiring iff at least one of the alerts is firing
+// at the time ts.
+func (as Alerts) StatusAt(ts time.Time) AlertStatus {
+	if as.HasFiringAt(ts) {
 		return AlertFiring
 	}
 	return AlertResolved

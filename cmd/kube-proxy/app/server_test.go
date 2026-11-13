@@ -17,334 +17,641 @@ limitations under the License.
 package app
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
-	"runtime"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/server/statusz"
+	"k8s.io/apiserver/pkg/util/compatibility"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	"k8s.io/component-base/configz"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	metricsfeatures "k8s.io/component-base/metrics/features"
+	"k8s.io/component-base/metrics/legacyregistry"
+	"k8s.io/component-base/metrics/testutil"
+	kubeproxyconfigv1alpha1 "k8s.io/kube-proxy/config/v1alpha1"
 
-	"k8s.io/kubernetes/cmd/kube-proxy/app/options"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/apis/componentconfig"
-	"k8s.io/kubernetes/pkg/util/iptables"
+	v1 "k8s.io/api/core/v1"
+	kubeproxyconfig "k8s.io/kubernetes/pkg/proxy/apis/config"
+	proxymetrics "k8s.io/kubernetes/pkg/proxy/metrics"
+	netutils "k8s.io/utils/net"
 )
 
-type fakeNodeInterface struct {
-	node api.Node
-}
+type fakeProxyServerLongRun struct{}
 
-func (fake *fakeNodeInterface) Get(hostname string) (*api.Node, error) {
-	return &fake.node, nil
-}
-
-type fakeIPTablesVersioner struct {
-	version string // what to return
-	err     error  // what to return
-}
-
-func (fake *fakeIPTablesVersioner) GetVersion() (string, error) {
-	return fake.version, fake.err
-}
-
-type fakeKernelCompatTester struct {
-	ok bool
-}
-
-func (fake *fakeKernelCompatTester) IsCompatible() error {
-	if !fake.ok {
-		return fmt.Errorf("error")
+// Run runs the specified ProxyServer.
+func (s *fakeProxyServerLongRun) Run(ctx context.Context) error {
+	for {
+		time.Sleep(2 * time.Second)
 	}
+}
+
+// CleanupAndExit runs in the specified ProxyServer.
+func (s *fakeProxyServerLongRun) CleanupAndExit() error {
 	return nil
 }
 
-func Test_getProxyMode(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("skipping on non-Linux")
-	}
-	var cases = []struct {
-		flag            string
-		annotationKey   string
-		annotationVal   string
-		iptablesVersion string
-		kernelCompat    bool
-		iptablesError   error
-		expected        string
-	}{
-		{ // flag says userspace
-			flag:     "userspace",
-			expected: proxyModeUserspace,
-		},
-		{ // flag says iptables, error detecting version
-			flag:          "iptables",
-			iptablesError: fmt.Errorf("oops!"),
-			expected:      proxyModeUserspace,
-		},
-		{ // flag says iptables, version too low
-			flag:            "iptables",
-			iptablesVersion: "0.0.0",
-			expected:        proxyModeUserspace,
-		},
-		{ // flag says iptables, version ok, kernel not compatible
-			flag:            "iptables",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    false,
-			expected:        proxyModeUserspace,
-		},
-		{ // flag says iptables, version ok, kernel is compatible
-			flag:            "iptables",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // detect, error
-			flag:          "",
-			iptablesError: fmt.Errorf("oops!"),
-			expected:      proxyModeUserspace,
-		},
-		{ // detect, version too low
-			flag:            "",
-			iptablesVersion: "0.0.0",
-			expected:        proxyModeUserspace,
-		},
-		{ // detect, version ok, kernel not compatible
-			flag:            "",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    false,
-			expected:        proxyModeUserspace,
-		},
-		{ // detect, version ok, kernel is compatible
-			flag:            "",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // annotation says userspace
-			flag:          "",
-			annotationKey: "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal: "userspace",
-			expected:      proxyModeUserspace,
-		},
-		{ // annotation says iptables, error detecting
-			flag:          "",
-			annotationKey: "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal: "iptables",
-			iptablesError: fmt.Errorf("oops!"),
-			expected:      proxyModeUserspace,
-		},
-		{ // annotation says iptables, version too low
-			flag:            "",
-			annotationKey:   "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal:   "iptables",
-			iptablesVersion: "0.0.0",
-			expected:        proxyModeUserspace,
-		},
-		{ // annotation says iptables, version ok, kernel not compatible
-			flag:            "",
-			annotationKey:   "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal:   "iptables",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    false,
-			expected:        proxyModeUserspace,
-		},
-		{ // annotation says iptables, version ok, kernel is compatible
-			flag:            "",
-			annotationKey:   "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal:   "iptables",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // annotation says something else, version ok
-			flag:            "",
-			annotationKey:   "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal:   "other",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // annotation says nothing, version ok
-			flag:            "",
-			annotationKey:   "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal:   "",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // annotation says userspace
-			flag:          "",
-			annotationKey: "net.beta.kubernetes.io/proxy-mode",
-			annotationVal: "userspace",
-			expected:      proxyModeUserspace,
-		},
-		{ // annotation says iptables, error detecting
-			flag:          "",
-			annotationKey: "net.beta.kubernetes.io/proxy-mode",
-			annotationVal: "iptables",
-			iptablesError: fmt.Errorf("oops!"),
-			expected:      proxyModeUserspace,
-		},
-		{ // annotation says iptables, version too low
-			flag:            "",
-			annotationKey:   "net.beta.kubernetes.io/proxy-mode",
-			annotationVal:   "iptables",
-			iptablesVersion: "0.0.0",
-			expected:        proxyModeUserspace,
-		},
-		{ // annotation says iptables, version ok, kernel not compatible
-			flag:            "",
-			annotationKey:   "net.beta.kubernetes.io/proxy-mode",
-			annotationVal:   "iptables",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    false,
-			expected:        proxyModeUserspace,
-		},
-		{ // annotation says iptables, version ok, kernel is compatible
-			flag:            "",
-			annotationKey:   "net.beta.kubernetes.io/proxy-mode",
-			annotationVal:   "iptables",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // annotation says something else, version ok
-			flag:            "",
-			annotationKey:   "net.beta.kubernetes.io/proxy-mode",
-			annotationVal:   "other",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // annotation says nothing, version ok
-			flag:            "",
-			annotationKey:   "net.beta.kubernetes.io/proxy-mode",
-			annotationVal:   "",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // flag says userspace, annotation disagrees
-			flag:            "userspace",
-			annotationKey:   "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal:   "iptables",
-			iptablesVersion: iptables.MinCheckVersion,
-			expected:        proxyModeUserspace,
-		},
-		{ // flag says iptables, annotation disagrees
-			flag:            "iptables",
-			annotationKey:   "net.experimental.kubernetes.io/proxy-mode",
-			annotationVal:   "userspace",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-		{ // flag says userspace, annotation disagrees
-			flag:            "userspace",
-			annotationKey:   "net.beta.kubernetes.io/proxy-mode",
-			annotationVal:   "iptables",
-			iptablesVersion: iptables.MinCheckVersion,
-			expected:        proxyModeUserspace,
-		},
-		{ // flag says iptables, annotation disagrees
-			flag:            "iptables",
-			annotationKey:   "net.beta.kubernetes.io/proxy-mode",
-			annotationVal:   "userspace",
-			iptablesVersion: iptables.MinCheckVersion,
-			kernelCompat:    true,
-			expected:        proxyModeIPTables,
-		},
-	}
-	for i, c := range cases {
-		getter := &fakeNodeInterface{}
-		getter.node.Annotations = map[string]string{c.annotationKey: c.annotationVal}
-		versioner := &fakeIPTablesVersioner{c.iptablesVersion, c.iptablesError}
-		kcompater := &fakeKernelCompatTester{c.kernelCompat}
-		r := getProxyMode(c.flag, getter, "host", versioner, kcompater)
-		if r != c.expected {
-			t.Errorf("Case[%d] Expected %q, got %q", i, c.expected, r)
-		}
+type fakeProxyServerError struct{}
+
+// Run runs the specified ProxyServer.
+func (s *fakeProxyServerError) Run(ctx context.Context) error {
+	for {
+		time.Sleep(2 * time.Second)
+		return fmt.Errorf("mocking error from ProxyServer.Run()")
 	}
 }
 
-// This test verifies that Proxy Server does not crash that means
-// Config and iptinterface are not nil when CleanupAndExit is true.
-// To avoid proxy crash: https://github.com/kubernetes/kubernetes/pull/14736
-func TestProxyServerWithCleanupAndExit(t *testing.T) {
-	// creates default config
-	config := options.NewProxyConfig()
-
-	// sets CleanupAndExit manually
-	config.CleanupAndExit = true
-
-	// creates new proxy server
-	proxyserver, err := NewProxyServerDefault(config)
-
-	// verifies that nothing is nill except error
-	assert.Nil(t, err)
-	assert.NotNil(t, proxyserver)
-	assert.NotNil(t, proxyserver.Config)
-	assert.NotNil(t, proxyserver.IptInterface)
+// CleanupAndExit runs in the specified ProxyServer.
+func (s *fakeProxyServerError) CleanupAndExit() error {
+	return errors.New("mocking error from ProxyServer.CleanupAndExit()")
 }
 
-func TestGetConntrackMax(t *testing.T) {
-	ncores := runtime.NumCPU()
-	testCases := []struct {
-		config   componentconfig.KubeProxyConfiguration
-		expected int
-		err      string
+// fakeMux matches the statusz mux interface used by statusz.Install:
+// it needs Handle(path, handler) and ListedPaths().
+type fakeMux struct {
+	handlers map[string]http.Handler
+	paths    []string
+}
+
+func newFakeMux(paths []string) *fakeMux {
+	return &fakeMux{
+		handlers: make(map[string]http.Handler),
+		paths:    paths,
+	}
+}
+
+func (m *fakeMux) Handle(path string, h http.Handler) { m.handlers[path] = h }
+func (m *fakeMux) ListedPaths() []string              { return m.paths }
+
+func Test_expandNodePortAddressKeywords(t *testing.T) {
+	v4 := netutils.ParseIPSloppy("192.168.1.1")
+	v6 := netutils.ParseIPSloppy("fd00::1")
+	loopback4 := net.IPv4(127, 0, 0, 1)
+	loopback6 := net.IPv6loopback
+
+	dualStack := map[v1.IPFamily]net.IP{v1.IPv4Protocol: v4, v1.IPv6Protocol: v6}
+	ipv4Only := map[v1.IPFamily]net.IP{v1.IPv4Protocol: v4, v1.IPv6Protocol: loopback6}
+	ipv6Only := map[v1.IPFamily]net.IP{v1.IPv4Protocol: loopback4, v1.IPv6Protocol: v6}
+
+	cases := []struct {
+		name      string
+		addresses []string
+		nodeIPs   map[v1.IPFamily]net.IP
+		expected  []string
 	}{
 		{
-			config:   componentconfig.KubeProxyConfiguration{},
-			expected: 0,
+			name:      "literal CIDRs pass through unchanged",
+			addresses: []string{"10.0.0.0/8", "fd01::/64"},
+			nodeIPs:   dualStack,
+			expected:  []string{"10.0.0.0/8", "fd01::/64"},
 		},
 		{
-			config: componentconfig.KubeProxyConfiguration{
-				ConntrackMax: 12345,
-			},
-			expected: 12345,
+			name:      "primary on dual-stack node",
+			addresses: []string{kubeproxyconfig.NodePortAddressesPrimary},
+			nodeIPs:   dualStack,
+			expected:  []string{"192.168.1.1/32", "fd00::1/128"},
 		},
 		{
-			config: componentconfig.KubeProxyConfiguration{
-				ConntrackMax:        12345,
-				ConntrackMaxPerCore: 67890,
-			},
-			expected: -1,
-			err:      "mutually exclusive",
+			name:      "primary on IPv4-only node",
+			addresses: []string{kubeproxyconfig.NodePortAddressesPrimary},
+			nodeIPs:   ipv4Only,
+			expected:  []string{"192.168.1.1/32"},
 		},
 		{
-			config: componentconfig.KubeProxyConfiguration{
-				ConntrackMaxPerCore: 67890, // use this if Max is 0
-				ConntrackMin:        1,     // avoid 0 default
-			},
-			expected: 67890 * ncores,
+			name:      "localhost on dual-stack node",
+			addresses: []string{kubeproxyconfig.NodePortAddressesLocalhost},
+			nodeIPs:   dualStack,
+			expected:  []string{"127.0.0.0/8", "::1/128"},
 		},
 		{
-			config: componentconfig.KubeProxyConfiguration{
-				ConntrackMaxPerCore: 1, // ensure that Min is considered
-				ConntrackMin:        123456,
-			},
-			expected: 123456,
+			name:      "localhost on IPv6-only node",
+			addresses: []string{kubeproxyconfig.NodePortAddressesLocalhost},
+			nodeIPs:   ipv6Only,
+			expected:  []string{"127.0.0.0/8", "::1/128"},
 		},
 		{
-			config: componentconfig.KubeProxyConfiguration{
-				ConntrackMaxPerCore: 0, // leave system setting
-				ConntrackMin:        123456,
-			},
-			expected: 0,
+			name:      "all on dual-stack node",
+			addresses: []string{kubeproxyconfig.NodePortAddressesAll},
+			nodeIPs:   dualStack,
+			expected:  []string{"0.0.0.0/0", "::/0"},
+		},
+		{
+			name:      "primary combined with localhost",
+			addresses: []string{kubeproxyconfig.NodePortAddressesPrimary, kubeproxyconfig.NodePortAddressesLocalhost},
+			nodeIPs:   dualStack,
+			expected:  []string{"192.168.1.1/32", "fd00::1/128", "127.0.0.0/8", "::1/128"},
+		},
+		{
+			name:      "keyword combined with literal CIDR",
+			addresses: []string{kubeproxyconfig.NodePortAddressesLocalhost, "10.0.0.0/8"},
+			nodeIPs:   ipv4Only,
+			expected:  []string{"127.0.0.0/8", "::1/128", "10.0.0.0/8"},
 		},
 	}
 
-	for i, tc := range testCases {
-		cfg := options.ProxyServerConfig{KubeProxyConfiguration: tc.config}
-		x, e := getConntrackMax(&cfg)
-		if e != nil {
-			if tc.err == "" {
-				t.Errorf("[%d] unexpected error: %v", i, e)
-			} else if !strings.Contains(e.Error(), tc.err) {
-				t.Errorf("[%d] expected an error containing %q: %v", i, tc.err, e)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := expandNodePortAddressKeywords(c.addresses, c.nodeIPs)
+			if !reflect.DeepEqual(got, c.expected) {
+				t.Errorf("expected %v, got %v", c.expected, got)
 			}
-		} else if x != tc.expected {
-			t.Errorf("[%d] expected %d, got %d", i, tc.expected, x)
+		})
+	}
+}
+
+func Test_checkBadConfig(t *testing.T) {
+	cases := []struct {
+		name  string
+		proxy *ProxyServer
+		err   bool
+	}{
+		{
+			name: "single-stack NodePortAddresses with single-stack config",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"10.0.0.0/8"},
+					},
+					NodePortAddresses: []string{"192.168.0.0/24"},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			err: false,
+		},
+		{
+			name: "dual-stack NodePortAddresses with dual-stack config",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"10.0.0.0/8", "fd09::/64"},
+					},
+					NodePortAddresses: []string{"192.168.0.0/24", "fd03::/64"},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			err: false,
+		},
+		{
+			name: "empty NodePortAddresses",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					NodePortAddresses: []string{},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			err: true,
+		},
+		{
+			name: "single-stack NodePortAddresses with dual-stack config",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"10.0.0.0/8", "fd09::/64"},
+					},
+					NodePortAddresses: []string{"192.168.0.0/24"},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			err: true,
+		},
+		{
+			name: "wrong-single-stack NodePortAddresses",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"fd09::/64"},
+					},
+					NodePortAddresses: []string{"192.168.0.0/24"},
+				},
+				PrimaryIPFamily: v1.IPv6Protocol,
+			},
+			err: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := checkBadConfig(c.proxy)
+			if err != nil && !c.err {
+				t.Errorf("unexpected error: %v", err)
+			} else if err == nil && c.err {
+				t.Errorf("unexpected lack of error")
+			}
+		})
+	}
+}
+
+func Test_checkBadIPConfig(t *testing.T) {
+	cases := []struct {
+		name    string
+		proxy   *ProxyServer
+		ssErr   bool
+		ssFatal bool
+		dsErr   bool
+		dsFatal bool
+	}{
+		{
+			name: "empty config",
+			proxy: &ProxyServer{
+				Config:          &kubeproxyconfig.KubeProxyConfiguration{},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+
+		{
+			name: "ok single-stack clusterCIDR",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"10.0.0.0/8"},
+					},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "ok dual-stack clusterCIDR",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"10.0.0.0/8", "fd01:2345::/64"},
+					},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "ok reversed dual-stack clusterCIDR",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"fd01:2345::/64", "10.0.0.0/8"},
+					},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "wrong-family clusterCIDR",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"fd01:2345::/64"},
+					},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr:   true,
+			ssFatal: false,
+			dsErr:   true,
+			dsFatal: false,
+		},
+		{
+			name: "wrong-family clusterCIDR when using ClusterCIDR LocalDetector",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocal: kubeproxyconfig.DetectLocalConfiguration{
+						ClusterCIDRs: []string{"fd01:2345::/64"},
+					},
+					DetectLocalMode: kubeproxyconfig.LocalModeClusterCIDR,
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr:   true,
+			ssFatal: true,
+			dsErr:   true,
+			dsFatal: false,
+		},
+
+		{
+			name: "ok single-stack node.spec.podCIDRs",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocalMode: kubeproxyconfig.LocalModeNodeCIDR,
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+				podCIDRs:        []string{"10.0.0.0/8"},
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "ok dual-stack node.spec.podCIDRs",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocalMode: kubeproxyconfig.LocalModeNodeCIDR,
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+				podCIDRs:        []string{"10.0.0.0/8", "fd01:2345::/64"},
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "ok reversed dual-stack node.spec.podCIDRs",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocalMode: kubeproxyconfig.LocalModeNodeCIDR,
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+				podCIDRs:        []string{"fd01:2345::/64", "10.0.0.0/8"},
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "wrong-family node.spec.podCIDRs",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					DetectLocalMode: kubeproxyconfig.LocalModeNodeCIDR,
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+				podCIDRs:        []string{"fd01:2345::/64"},
+			},
+			ssErr:   true,
+			ssFatal: true,
+			dsErr:   true,
+			dsFatal: true,
+		},
+
+		{
+			name: "ok winkernel.sourceVip",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					Winkernel: kubeproxyconfig.KubeProxyWinkernelConfiguration{
+						SourceVip: "10.0.0.1",
+					},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "wrong family winkernel.sourceVip",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					Winkernel: kubeproxyconfig.KubeProxyWinkernelConfiguration{
+						SourceVip: "fd01:2345::1",
+					},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr:   true,
+			ssFatal: false,
+			dsErr:   true,
+			dsFatal: false,
+		},
+
+		{
+			name: "ok IPv4 metricsBindAddress",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					MetricsBindAddress: "10.0.0.1:9999",
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "ok IPv6 metricsBindAddress",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					MetricsBindAddress: "[fd01:2345::1]:9999",
+				},
+				PrimaryIPFamily: v1.IPv6Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "ok unspecified wrong-family metricsBindAddress",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					MetricsBindAddress: "0.0.0.0:9999",
+				},
+				PrimaryIPFamily: v1.IPv6Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "wrong family metricsBindAddress",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					MetricsBindAddress: "10.0.0.1:9999",
+				},
+				PrimaryIPFamily: v1.IPv6Protocol,
+			},
+			ssErr:   true,
+			ssFatal: false,
+			dsErr:   false,
+		},
+
+		{
+			name: "ok ipvs.excludeCIDRs",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					IPVS: kubeproxyconfig.KubeProxyIPVSConfiguration{
+						ExcludeCIDRs: []string{"10.0.0.0/8"},
+					},
+				},
+				PrimaryIPFamily: v1.IPv4Protocol,
+			},
+			ssErr: false,
+			dsErr: false,
+		},
+		{
+			name: "wrong family ipvs.excludeCIDRs",
+			proxy: &ProxyServer{
+				Config: &kubeproxyconfig.KubeProxyConfiguration{
+					IPVS: kubeproxyconfig.KubeProxyIPVSConfiguration{
+						ExcludeCIDRs: []string{"10.0.0.0/8", "192.168.0.0/24"},
+					},
+				},
+				PrimaryIPFamily: v1.IPv6Protocol,
+			},
+			ssErr:   true,
+			ssFatal: false,
+			dsErr:   false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err, fatal := checkBadIPConfig(c.proxy, false)
+			if err != nil && !c.ssErr {
+				t.Errorf("unexpected error in single-stack case: %v", err)
+			} else if err == nil && c.ssErr {
+				t.Errorf("unexpected lack of error in single-stack case")
+			} else if fatal != c.ssFatal {
+				t.Errorf("expected fatal=%v, got %v", c.ssFatal, fatal)
+			}
+
+			err, fatal = checkBadIPConfig(c.proxy, true)
+			if err != nil && !c.dsErr {
+				t.Errorf("unexpected error in dual-stack case: %v", err)
+			} else if err == nil && c.dsErr {
+				t.Errorf("unexpected lack of error in dual-stack case")
+			} else if fatal != c.dsFatal {
+				t.Errorf("expected fatal=%v, got %v", c.dsFatal, fatal)
+			}
+		})
+	}
+}
+func TestStatuszRegistryReceivesListedPaths(t *testing.T) {
+	wantPaths := []string{"/livez", "/readyz", "/healthz", statusz.DefaultStatuszPath}
+	m := newFakeMux(wantPaths)
+
+	reg := statusz.NewRegistry(
+		compatibility.DefaultBuildEffectiveVersion(),
+		statusz.WithListedPaths(m.ListedPaths()),
+	)
+	statusz.Install(m, "kube-proxy", reg)
+
+	h, ok := m.handlers[statusz.DefaultStatuszPath]
+	if !ok {
+		t.Fatalf("statusz handler not installed at %q", statusz.DefaultStatuszPath)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, statusz.DefaultStatuszPath, nil)
+	req.Header.Add("Accept", "text/plain")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d; body:\n%s", rr.Code, rr.Body.String())
+	}
+
+	body := rr.Body.String()
+
+	// Look for the "Paths" line manually instead of regex
+	lines := strings.Split(body, "\n")
+	var foundPathsLine string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "Paths") {
+			foundPathsLine = line
+			break
 		}
 	}
+	if foundPathsLine == "" {
+		t.Fatalf("failed to find Paths line in body:\n%s", body)
+	}
+
+	fields := strings.Fields(foundPathsLine)
+	if len(fields) < 2 {
+		t.Fatalf("unexpected format in Paths line: %q", foundPathsLine)
+	}
+	gotPaths := fields[1:]
+
+	// Use sets for order-independent comparison
+	wantSet := sets.New[string](wantPaths...)
+	gotSet := sets.New[string](gotPaths...)
+
+	if !wantSet.Equal(gotSet) {
+		t.Errorf("statusz listed paths mismatch.\nwant: %v\ngot:  %v\nbody:\n%s",
+			wantSet.UnsortedList(), gotSet.UnsortedList(), body)
+	}
+}
+
+func TestConfigz(t *testing.T) {
+	configz.Delete(kubeproxyconfig.GroupName)
+	cz, err := configz.New(kubeproxyconfig.GroupName)
+	if err != nil {
+		t.Fatalf("unable to register configz: %v", err)
+	}
+	defer configz.Delete(kubeproxyconfig.GroupName)
+
+	externalConfig := &kubeproxyconfigv1alpha1.KubeProxyConfiguration{}
+	externalConfig.SetGroupVersionKind(kubeproxyconfigv1alpha1.SchemeGroupVersion.WithKind("KubeProxyConfiguration"))
+	if err := cz.Set(externalConfig); err != nil {
+		t.Fatalf("unable to set configz: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	configz.InstallHandler(mux)
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	resp, err := http.Get(s.URL + "/configz")
+	if err != nil {
+		t.Fatalf("unable to GET /configz: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("unable to read response body: %v", err)
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("want status 200, got %d", resp.StatusCode)
+	}
+
+	var configzResp map[string]unstructured.Unstructured
+	if err := json.Unmarshal(body, &configzResp); err != nil {
+		t.Fatalf("failed to unmarshal configz: %v", err)
+	}
+	cfg, ok := configzResp[kubeproxyconfig.GroupName]
+	if !ok {
+		t.Fatalf("configz missing %q key", kubeproxyconfig.GroupName)
+	}
+	if cfg.GetAPIVersion() != "kubeproxy.config.k8s.io/v1alpha1" {
+		t.Errorf("unexpected APIVersion: %s", cfg.GetAPIVersion())
+	}
+	if cfg.GetKind() != "KubeProxyConfiguration" {
+		t.Errorf("unexpected Kind: %s", cfg.GetKind())
+	}
+
+	// confirm that they expose public config type
+	var proxyConfig kubeproxyconfigv1alpha1.KubeProxyConfiguration
+	err = json.Unmarshal(body, &struct {
+		ComponentConfig *kubeproxyconfigv1alpha1.KubeProxyConfiguration `json:"kubeproxy.config.k8s.io"`
+	}{ComponentConfig: &proxyConfig})
+	if err != nil {
+		t.Errorf("failed to deserialize into public config type: %v", err)
+	}
+}
+
+func TestKubeProxyNativeHistogramMetrics(t *testing.T) {
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, metricsfeatures.NativeHistograms, true)
+	metricsfeatures.ApplyFeatureGates(utilfeature.DefaultFeatureGate)
+	proxymetrics.RegisterMetrics(kubeproxyconfig.ProxyModeIPTables)
+
+	proxymetrics.SyncProxyRulesLatency.WithLabelValues("4").Observe(0.001)
+	ts := httptest.NewServer(legacyregistry.Handler())
+	defer ts.Close()
+
+	histogramMetric := "kubeproxy_sync_proxy_rules_duration_seconds"
+	metrics, err := testutil.ScrapeMetricsProto(ts.URL+"/metrics", ts.Client())
+	if err != nil {
+		t.Fatalf("failed to scrape metrics: %v", err)
+	}
+	mf, ok := metrics[histogramMetric]
+	if !ok {
+		t.Fatalf("metric %q not found in kube-proxy metrics endpoint", histogramMetric)
+	}
+	testutil.AssertHasNativeHistogram(t, mf, map[string]string{"ip_family": "4"})
 }

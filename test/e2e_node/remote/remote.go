@@ -17,100 +17,80 @@ limitations under the License.
 package remote
 
 import (
-	"flag"
 	"fmt"
-	"io/ioutil"
-	"math/rand"
+	"io"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
+	"regexp"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/golang/glog"
-	utilerrors "k8s.io/kubernetes/pkg/util/errors"
-	"k8s.io/kubernetes/test/e2e_node/build"
+	utilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/klog/v2"
 )
 
-var sshOptions = flag.String("ssh-options", "", "Commandline options passed to ssh.")
-var sshEnv = flag.String("ssh-env", "", "Use predefined ssh options for environment.  Options: gce")
-var testTimeoutSeconds = flag.Duration("test-timeout", 45*time.Minute, "How long (in golang duration format) to wait for ginkgo tests to complete.")
-var resultsDir = flag.String("results-dir", "/tmp/", "Directory to scp test results to.")
+var testTimeout = CommandLine.Duration("test-timeout", 45*time.Minute, "How long (in golang duration format) to wait for ginkgo tests to complete.")
+var resultsDir = CommandLine.String("results-dir", defaultResultsDir(), "Directory to scp test results to.")
 
-var sshOptionsMap map[string]string
-
-const (
-	archiveName  = "e2e_node_test.tar.gz"
-	CNIRelease   = "07a8a28637e97b22eb8dfe710eeae1344f69d16e"
-	CNIDirectory = "cni"
-)
-
-var CNIURL = fmt.Sprintf("https://storage.googleapis.com/kubernetes-release/network-plugins/cni-%s.tar.gz", CNIRelease)
-
-var hostnameIpOverrides = struct {
-	sync.RWMutex
-	m map[string]string
-}{m: make(map[string]string)}
-
-func init() {
-	usr, err := user.Current()
-	if err != nil {
-		glog.Fatal(err)
+func defaultResultsDir() string {
+	if artifacts, ok := os.LookupEnv("ARTIFACTS"); ok {
+		return artifacts
 	}
-	sshOptionsMap = map[string]string{
-		"gce": fmt.Sprintf("-i %s/.ssh/google_compute_engine -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o CheckHostIP=no -o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o LogLevel=ERROR", usr.HomeDir),
-	}
+	return "/tmp"
 }
 
-func AddHostnameIp(hostname, ip string) {
-	hostnameIpOverrides.Lock()
-	defer hostnameIpOverrides.Unlock()
-	hostnameIpOverrides.m[hostname] = ip
+const archiveName = "e2e_node_test.tar.gz"
+
+func copyKubeletConfigIfExists(kubeletConfigFile, dstDir string) error {
+	srcStat, err := os.Stat(kubeletConfigFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		} else {
+			return err
+		}
+	}
+
+	if !srcStat.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", kubeletConfigFile)
+	}
+
+	source, err := os.Open(kubeletConfigFile)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+
+	dst := filepath.Join(dstDir, "kubeletconfig.yaml")
+	destination, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer destination.Close()
+
+	_, err = io.Copy(destination, source)
+	return err
 }
 
-func GetHostnameOrIp(hostname string) string {
-	hostnameIpOverrides.RLock()
-	defer hostnameIpOverrides.RUnlock()
-	if ip, found := hostnameIpOverrides.m[hostname]; found {
-		return ip
-	}
-	return hostname
-}
-
-// CreateTestArchive builds the local source and creates a tar archive e2e_node_test.tar.gz containing
-// the binaries k8s required for node e2e tests
-func CreateTestArchive() (string, error) {
-	// Build the executables
-	if err := build.BuildGo(); err != nil {
-		return "", fmt.Errorf("failed to build the depedencies: %v", err)
-	}
-
-	// Make sure we can find the newly built binaries
-	buildOutputDir, err := build.GetK8sBuildOutputDir()
+// CreateTestArchive creates the archive package for the node e2e test.
+func CreateTestArchive(suite TestSuite, systemSpecName, kubeletConfigFile string) (string, error) {
+	klog.V(2).Infof("Building archive...")
+	tardir, err := os.MkdirTemp("", "node-e2e-archive")
 	if err != nil {
-		return "", fmt.Errorf("failed to locate kubernetes build output directory %v", err)
-	}
-
-	glog.Infof("Building archive...")
-	tardir, err := ioutil.TempDir("", "node-e2e-archive")
-	if err != nil {
-		return "", fmt.Errorf("failed to create temporary directory %v.", err)
+		return "", fmt.Errorf("failed to create temporary directory %v", err)
 	}
 	defer os.RemoveAll(tardir)
 
-	// Copy binaries
-	requiredBins := []string{"kubelet", "e2e_node.test", "ginkgo"}
-	for _, bin := range requiredBins {
-		source := filepath.Join(buildOutputDir, bin)
-		if _, err := os.Stat(source); err != nil {
-			return "", fmt.Errorf("failed to locate test binary %s: %v", bin, err)
-		}
-		out, err := exec.Command("cp", source, filepath.Join(tardir, bin)).CombinedOutput()
-		if err != nil {
-			return "", fmt.Errorf("failed to copy %q: %v Output: %q", bin, err, out)
-		}
+	err = copyKubeletConfigIfExists(kubeletConfigFile, tardir)
+	if err != nil {
+		return "", fmt.Errorf("failed to copy kubelet config: %w", err)
+	}
+
+	// Call the suite function to setup the test package.
+	err = suite.SetupTestPackage(tardir, systemSpecName)
+	if err != nil {
+		return "", fmt.Errorf("failed to setup test package %q: %w", tardir, err)
 	}
 
 	// Build the tar
@@ -121,115 +101,89 @@ func CreateTestArchive() (string, error) {
 
 	dir, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("failed to get working directory %v.", err)
+		return "", fmt.Errorf("failed to get working directory %v", err)
 	}
 	return filepath.Join(dir, archiveName), nil
 }
 
-// Returns the command output, whether the exit was ok, and any errors
-func RunRemote(archive string, host string, cleanup bool, junitFilePrefix string, setupNode bool, testArgs string, ginkgoFlags string) (string, bool, error) {
-	if setupNode {
-		uname, err := user.Current()
-		if err != nil {
-			return "", false, fmt.Errorf("could not find username: %v", err)
-		}
-		output, err := RunSshCommand("ssh", GetHostnameOrIp(host), "--", "sudo", "usermod", "-a", "-G", "docker", uname.Username)
-		if err != nil {
-			return "", false, fmt.Errorf("instance %s not running docker daemon - Command failed: %s", host, output)
-		}
-	}
+// RunRemote returns the command Output, whether the exit was ok, and any errors
+type RunRemoteConfig struct {
+	Suite                                                                                    TestSuite
+	Archive                                                                                  string
+	Host                                                                                     string
+	Cleanup                                                                                  bool
+	ImageDesc, JunitFileName, TestArgs, GinkgoArgs, SystemSpecName, ExtraEnvs, RuntimeConfig string
+}
 
+func RunRemote(cfg RunRemoteConfig) (string, bool, error) {
 	// Create the temp staging directory
-	glog.Infof("Staging test binaries on %s", host)
-	tmp := fmt.Sprintf("/tmp/gcloud-e2e-%d", rand.Int31())
-	_, err := RunSshCommand("ssh", GetHostnameOrIp(host), "--", "mkdir", tmp)
-	if err != nil {
+	klog.V(2).Infof("Staging test binaries on %q", cfg.Host)
+	workspace := newWorkspaceDir()
+	// Do not sudo here, so that we can use scp to copy test archive to the directory.
+	if output, err := SSHNoSudo(cfg.Host, "mkdir", workspace); err != nil {
 		// Exit failure with the error
-		return "", false, err
+		return "", false, fmt.Errorf("failed to create workspace directory %q on Host %q: %v Output: %q", workspace, cfg.Host, err, output)
 	}
-	if cleanup {
+	if cfg.Cleanup {
 		defer func() {
-			output, err := RunSshCommand("ssh", GetHostnameOrIp(host), "--", "rm", "-rf", tmp)
+			output, err := SSH(cfg.Host, "rm", "-rf", workspace)
 			if err != nil {
-				glog.Errorf("failed to cleanup tmp directory %s on host %v.  Output:\n%s", tmp, err, output)
+				klog.Errorf("failed to cleanup workspace %q on Host %q: %v.  Output:\n%s", workspace, cfg.Host, err, output)
 			}
 		}()
 	}
 
-	// Install the cni plugin.
-	cniPath := filepath.Join(tmp, CNIDirectory)
-	if _, err := RunSshCommand("ssh", GetHostnameOrIp(host), "--", "sh", "-c",
-		getSshCommand(" ; ", fmt.Sprintf("sudo mkdir -p %s", cniPath),
-			fmt.Sprintf("sudo wget -O - %s | sudo tar -xz -C %s", CNIURL, cniPath))); err != nil {
-		// Exit failure with the error
-		return "", false, err
-	}
-
-	// Configure iptables firewall rules
-	// TODO: consider calling bootstrap script to configure host based on OS
-	cmd := getSshCommand("&&",
-		`iptables -L INPUT | grep "Chain INPUT (policy DROP)"`,
-		"(iptables -C INPUT -w -p TCP -j ACCEPT || iptables -A INPUT -w -p TCP -j ACCEPT)",
-		"(iptables -C INPUT -w -p UDP -j ACCEPT || iptables -A INPUT -w -p UDP -j ACCEPT)",
-		"(iptables -C INPUT -w -p ICMP -j ACCEPT || iptables -A INPUT -w -p ICMP -j ACCEPT)")
-	output, err := RunSshCommand("ssh", GetHostnameOrIp(host), "--", "sudo", "sh", "-c", cmd)
-	if err != nil {
-		glog.Errorf("Failed to configured firewall: %v output: %v", err, output)
-	}
-	cmd = getSshCommand("&&",
-		`iptables -L FORWARD | grep "Chain FORWARD (policy DROP)" > /dev/null`,
-		"(iptables -C FORWARD -w -p TCP -j ACCEPT || iptables -A FORWARD -w -p TCP -j ACCEPT)",
-		"(iptables -C FORWARD -w -p UDP -j ACCEPT || iptables -A FORWARD -w -p UDP -j ACCEPT)",
-		"(iptables -C FORWARD -w -p ICMP -j ACCEPT || iptables -A FORWARD -w -p ICMP -j ACCEPT)")
-	output, err = RunSshCommand("ssh", GetHostnameOrIp(host), "--", "sudo", "sh", "-c", cmd)
-	if err != nil {
-		glog.Errorf("Failed to configured firewall: %v output: %v", err, output)
-	}
-
 	// Copy the archive to the staging directory
-	_, err = RunSshCommand("scp", archive, fmt.Sprintf("%s:%s/", GetHostnameOrIp(host), tmp))
-	if err != nil {
+	if output, err := runSSHCommand(cfg.Host, "scp", cfg.Archive, fmt.Sprintf("%s:%s/", GetHostnameOrIP(cfg.Host), workspace)); err != nil {
 		// Exit failure with the error
-		return "", false, err
+		return "", false, fmt.Errorf("failed to copy test archive: %v, Output: %q", err, output)
 	}
-
-	// Kill any running node processes
-	cmd = getSshCommand(" ; ",
-		"sudo pkill kubelet",
-		"sudo pkill kube-apiserver",
-		"sudo pkill etcd",
-	)
-	// No need to log an error if pkill fails since pkill will fail if the commands are not running.
-	// If we are unable to stop existing running k8s processes, we should see messages in the kubelet/apiserver/etcd
-	// logs about failing to bind the required ports.
-	glog.Infof("Killing any existing node processes on %s", host)
-	RunSshCommand("ssh", GetHostnameOrIp(host), "--", "sh", "-c", cmd)
 
 	// Extract the archive
-	cmd = getSshCommand(" && ", fmt.Sprintf("cd %s", tmp), fmt.Sprintf("tar -xzvf ./%s", archiveName))
-	glog.Infof("Extracting tar on %s", host)
-	output, err = RunSshCommand("ssh", GetHostnameOrIp(host), "--", "sh", "-c", cmd)
-	if err != nil {
-		// Exit failure with the error
-		return "", false, err
-	}
-	// Run the tests
-	cmd = getSshCommand(" && ",
-		fmt.Sprintf("cd %s", tmp),
-		fmt.Sprintf("timeout -k 30s %fs ./ginkgo %s ./e2e_node.test -- --logtostderr --v 4 --node-name=%s --report-dir=%s/results --report-prefix=%s %s",
-			testTimeoutSeconds.Seconds(), ginkgoFlags, host, tmp, junitFilePrefix, testArgs),
+	cmd := getSSHCommand(" && ",
+		fmt.Sprintf("cd %s", workspace),
+		fmt.Sprintf("tar -xzvf ./%s", archiveName),
 	)
-	aggErrs := []error{}
+	klog.V(2).Infof("Extracting tar on %q", cfg.Host)
+	// Do not use sudo here, because `sudo tar -x` will recover the file ownership inside the tar ball, but
+	// we want the extracted files to be owned by the current user.
+	if output, err := SSHNoSudo(cfg.Host, "sh", "-c", cmd); err != nil {
+		// Exit failure with the error
+		return "", false, fmt.Errorf("failed to extract test archive: %v, Output: %q", err, output)
+	}
 
-	glog.Infof("Starting tests on %s", host)
-	output, err = RunSshCommand("ssh", GetHostnameOrIp(host), "--", "sh", "-c", cmd)
+	// Create the test result directory.
+	resultDir := filepath.Join(workspace, "results")
+	if output, err := SSHNoSudo(cfg.Host, "mkdir", resultDir); err != nil {
+		// Exit failure with the error
+		return "", false, fmt.Errorf("failed to create test result directory %q on Host %q: %v Output: %q", resultDir, cfg.Host, err, output)
+	}
 
+	allGinkgoFlags := cfg.GinkgoArgs
+	if !strings.Contains(allGinkgoFlags, "-timeout") {
+		klog.Warningf("ginkgo flags are missing explicit --timeout (ginkgo defaults to 60 minutes)")
+		// see https://github.com/onsi/ginkgo/blob/master/docs/index.md#:~:text=ginkgo%20%2D%2Dtimeout%3Dduration
+		// ginkgo suite timeout should be more than the default but less than the
+		// full test timeout, so we should use the average of the two.
+		suiteTimeout := int(testTimeout.Minutes())
+		suiteTimeout = (60 + suiteTimeout) / 2
+		allGinkgoFlags = fmt.Sprintf("%s --timeout=%dm", allGinkgoFlags, suiteTimeout)
+		klog.Infof("updated ginkgo flags: %s", allGinkgoFlags)
+	}
+
+	klog.V(2).Infof("Running test on %q", cfg.Host)
+	output, err := cfg.Suite.RunTest(cfg.Host, workspace, resultDir, cfg.ImageDesc, cfg.JunitFileName, cfg.TestArgs,
+		allGinkgoFlags, cfg.SystemSpecName, cfg.ExtraEnvs, cfg.RuntimeConfig, *testTimeout)
+
+	var aggErrs []error
+	// Do not log the Output here, let the caller deal with the test Output.
 	if err != nil {
 		aggErrs = append(aggErrs, err)
+		collectSystemLog(cfg.Host)
 	}
 
-	glog.Infof("Copying test artifacts from %s", host)
-	scpErr := getTestArtifacts(host, tmp)
+	klog.V(2).Infof("Copying test artifacts from %q", cfg.Host)
+	scpErr := getTestArtifacts(cfg.Host, workspace)
 	if scpErr != nil {
 		aggErrs = append(aggErrs, scpErr)
 	}
@@ -237,36 +191,111 @@ func RunRemote(archive string, host string, cleanup bool, junitFilePrefix string
 	return output, len(aggErrs) == 0, utilerrors.NewAggregate(aggErrs)
 }
 
-func getTestArtifacts(host, testDir string) error {
-	_, err := RunSshCommand("scp", "-r", fmt.Sprintf("%s:%s/results/", GetHostnameOrIp(host), testDir), fmt.Sprintf("%s/%s", *resultsDir, host))
-	if err != nil {
-		return err
-	}
+const (
+	// workspaceDirPrefix is the string prefix used in the workspace directory name.
+	workspaceDirPrefix = "node-e2e-"
+	// timestampFormat is the timestamp format used in the node e2e directory name.
+	timestampFormat = "20060102T150405"
+)
 
-	// Copy junit to the top of artifacts
-	_, err = RunSshCommand("scp", fmt.Sprintf("%s:%s/results/junit*", GetHostnameOrIp(host), testDir), fmt.Sprintf("%s/", *resultsDir))
-	if err != nil {
-		return err
+func getTimestamp() string {
+	return fmt.Sprint(time.Now().Format(timestampFormat))
+}
+
+func newWorkspaceDir() string {
+	return filepath.Join("/tmp", workspaceDirPrefix+getTimestamp())
+}
+
+// GetTimestampFromWorkspaceDir parses the workspace directory name and gets the timestamp part of it.
+// This can later be used to name other artifacts (such as the
+// kubelet-${instance}.service systemd transient service used to launch
+// Kubelet) so that they can be matched to each other.
+func GetTimestampFromWorkspaceDir(dir string) string {
+	dirTimestamp := strings.TrimPrefix(filepath.Base(dir), workspaceDirPrefix)
+	re := regexp.MustCompile("^\\d{8}T\\d{6}$")
+	if re.MatchString(dirTimestamp) {
+		return dirTimestamp
+	}
+	// Fallback: if we can't find that timestamp, default to using Now()
+	return getTimestamp()
+}
+
+func getTestArtifacts(host, testDir string) error {
+	logPath := filepath.Join(*resultsDir, host)
+	if err := os.MkdirAll(logPath, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory %q: %w", logPath, err)
+	}
+	// Copy logs (if any) to artifacts/hostname
+	if _, err := SSH(host, "ls", fmt.Sprintf("%s/results/*.log", testDir)); err == nil {
+		if _, err := runSSHCommand(host, "scp", "-r", fmt.Sprintf("%s:%s/results/*.log", GetHostnameOrIP(host), testDir), logPath); err != nil {
+			return err
+		}
+	}
+	// Copy json files (if any) to artifacts.
+	if _, err := SSH(host, "ls", fmt.Sprintf("%s/results/*.json", testDir)); err == nil {
+		if _, err = runSSHCommand(host, "scp", "-r", fmt.Sprintf("%s:%s/results/*.json", GetHostnameOrIP(host), testDir), *resultsDir); err != nil {
+			return err
+		}
+	}
+	// Copy junit results (if any) to artifacts
+	if _, err := SSH(host, "ls", fmt.Sprintf("%s/results/junit*", testDir)); err == nil {
+		// Copy junit (if any) to the top of artifacts
+		if _, err = runSSHCommand(host, "scp", fmt.Sprintf("%s:%s/results/junit*", GetHostnameOrIP(host), testDir), *resultsDir); err != nil {
+			return err
+		}
+	}
+	// Copy container logs to artifacts/hostname
+	klog.V(4).Info("Add 'execute' permission to /var/log/pods to copy logs")
+	if _, err := SSH(host, "chmod", "o+x", "/var/log/pods"); err == nil {
+		if _, err := SSH(host, "chmod", "-R", "a+r", "/var/log/pods"); err == nil {
+			if _, err = runSSHCommand(host, "scp", "-r", fmt.Sprintf("%s:/var/log/pods/", GetHostnameOrIP(host)), logPath); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
-// getSshCommand handles proper quoting so that multiple commands are executed in the same shell over ssh
-func getSshCommand(sep string, args ...string) string {
-	return fmt.Sprintf("'%s'", strings.Join(args, sep))
+// collectSystemLog is a temporary hack to collect system log when encountered on
+// unexpected error.
+func collectSystemLog(host string) {
+	// Encountered an unexpected error. The remote test harness may not
+	// have finished retrieved and stored all the logs in this case. Try
+	// to get some logs for debugging purposes.
+	// TODO: This is a best-effort, temporary hack that only works for
+	// journald nodes. We should have a more robust way to collect logs.
+	var (
+		logName  = "system.log"
+		logPath  = fmt.Sprintf("/tmp/%s-%s", getTimestamp(), logName)
+		destPath = fmt.Sprintf("%s/%s-%s", *resultsDir, host, logName)
+	)
+	klog.V(2).Infof("Test failed unexpectedly. Attempting to retrieving system logs (only works for nodes with journald)")
+	// Try getting the system logs from journald and store it to a file.
+	// Don't reuse the original test directory on the remote host because
+	// it could've be been removed if the node was rebooted.
+	if output, err := SSH(host, "sh", "-c", fmt.Sprintf("'journalctl --system --all > %s'", logPath)); err == nil {
+		klog.V(2).Infof("Got the system logs from journald; copying it back...")
+		if output, err := runSSHCommand(host, "scp", fmt.Sprintf("%s:%s", GetHostnameOrIP(host), logPath), destPath); err != nil {
+			klog.V(2).Infof("Failed to copy the log: err: %v, output: %q", err, output)
+		}
+	} else {
+		klog.V(2).Infof("Failed to run journactl (normal if it doesn't exist on the node): %v, output: %q", err, output)
+	}
 }
 
-// runSshCommand executes the ssh or scp command, adding the flag provided --ssh-options
-func RunSshCommand(cmd string, args ...string) (string, error) {
-	if env, found := sshOptionsMap[*sshEnv]; found {
-		args = append(strings.Split(env, " "), args...)
+// WriteLog is a temporary function to make it possible to write log
+// in the runner. This is used to collect serial console log.
+// TODO(random-liu): Use the log-dump script in cluster e2e.
+func WriteLog(host, filename, content string) error {
+	logPath := filepath.Join(*resultsDir, host)
+	if err := os.MkdirAll(logPath, 0755); err != nil {
+		return fmt.Errorf("failed to create log directory %q: %w", logPath, err)
 	}
-	if *sshOptions != "" {
-		args = append(strings.Split(*sshOptions, " "), args...)
-	}
-	output, err := exec.Command(cmd, args...).CombinedOutput()
+	f, err := os.Create(filepath.Join(logPath, filename))
 	if err != nil {
-		return fmt.Sprintf("%s", output), fmt.Errorf("command [%s %s] failed with error: %v and output:\n%s", cmd, strings.Join(args, " "), err, output)
+		return err
 	}
-	return fmt.Sprintf("%s", output), nil
+	defer f.Close()
+	_, err = f.WriteString(content)
+	return err
 }

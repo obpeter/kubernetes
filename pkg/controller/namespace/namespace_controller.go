@@ -17,155 +17,158 @@ limitations under the License.
 package namespace
 
 import (
+	"context"
+	"sync"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/client/cache"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/client/typed/dynamic"
-	"k8s.io/kubernetes/pkg/controller"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/util/metrics"
-	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
-	"k8s.io/kubernetes/pkg/util/wait"
-	"k8s.io/kubernetes/pkg/util/workqueue"
-	"k8s.io/kubernetes/pkg/watch"
+	"golang.org/x/time/rate"
 
-	"github.com/golang/glog"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
+	coreinformers "k8s.io/client-go/informers/core/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	corelisters "k8s.io/client-go/listers/core/v1"
+	"k8s.io/client-go/metadata"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/kubernetes/pkg/controller"
+	"k8s.io/kubernetes/pkg/controller/namespace/deletion"
+
+	"k8s.io/klog/v2"
+)
+
+const (
+	// namespaceDeletionGracePeriod is the time period to wait before processing a received namespace event.
+	// This allows time for the following to occur:
+	// * lifecycle admission plugins on HA apiservers to also observe a namespace
+	//   deletion and prevent new objects from being created in the terminating namespace
+	// * non-leader etcd servers to observe last-minute object creations in a namespace
+	//   so this controller's cleanup can actually clean up all objects
+	namespaceDeletionGracePeriod = 5 * time.Second
 )
 
 // NamespaceController is responsible for performing actions dependent upon a namespace phase
 type NamespaceController struct {
-	// client that purges namespace content, must have list/delete privileges on all content
-	kubeClient clientset.Interface
-	// clientPool manages a pool of dynamic clients
-	clientPool dynamic.ClientPool
-	// store that holds the namespaces
-	store cache.Store
-	// controller that observes the namespaces
-	controller *cache.Controller
+	// lister that can list namespaces from a shared cache
+	lister corelisters.NamespaceLister
+	// returns true when the namespace cache is ready
+	listerSynced cache.InformerSynced
 	// namespaces that have been queued up for processing by workers
-	queue workqueue.RateLimitingInterface
-	// list of preferred group versions and their corresponding resource set for namespace deletion
-	groupVersionResources []unversioned.GroupVersionResource
-	// opCache is a cache to remember if a particular operation is not supported to aid dynamic client.
-	opCache operationNotSupportedCache
-	// finalizerToken is the finalizer token managed by this controller
-	finalizerToken api.FinalizerName
+	queue workqueue.TypedRateLimitingInterface[string]
+	// helper to delete all resources in the namespace when the namespace is deleted.
+	namespacedResourcesDeleter deletion.NamespacedResourcesDeleterInterface
 }
 
 // NewNamespaceController creates a new NamespaceController
 func NewNamespaceController(
+	ctx context.Context,
 	kubeClient clientset.Interface,
-	clientPool dynamic.ClientPool,
-	groupVersionResources []unversioned.GroupVersionResource,
+	metadataClient metadata.Interface,
+	discoverResourcesFn func() ([]*metav1.APIResourceList, error),
+	namespaceInformer coreinformers.NamespaceInformer,
 	resyncPeriod time.Duration,
-	finalizerToken api.FinalizerName) *NamespaceController {
-
-	// the namespace deletion code looks at the discovery document to enumerate the set of resources on the server.
-	// it then finds all namespaced resources, and in response to namespace deletion, will call delete on all of them.
-	// unfortunately, the discovery information does not include the list of supported verbs/methods.  if the namespace
-	// controller calls LIST/DELETECOLLECTION for a resource, it will get a 405 error from the server and cache that that was the case.
-	// we found in practice though that some auth engines when encountering paths they don't know about may return a 50x.
-	// until we have verbs, we pre-populate resources that do not support list or delete for well-known apis rather than
-	// probing the server once in order to be told no.
-	opCache := operationNotSupportedCache{}
-	ignoredGroupVersionResources := []unversioned.GroupVersionResource{
-		{Group: "", Version: "v1", Resource: "bindings"},
-	}
-	for _, ignoredGroupVersionResource := range ignoredGroupVersionResources {
-		opCache[operationKey{op: operationDeleteCollection, gvr: ignoredGroupVersionResource}] = true
-		opCache[operationKey{op: operationList, gvr: ignoredGroupVersionResource}] = true
-	}
+	finalizerToken v1.FinalizerName) *NamespaceController {
+	logger := klog.FromContext(ctx)
 
 	// create the controller so we can inject the enqueue function
 	namespaceController := &NamespaceController{
-		kubeClient: kubeClient,
-		clientPool: clientPool,
-		queue:      workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "namespace"),
-		groupVersionResources: groupVersionResources,
-		opCache:               opCache,
-		finalizerToken:        finalizerToken,
+		queue: workqueue.NewTypedRateLimitingQueueWithConfig(
+			nsControllerRateLimiter(),
+			workqueue.TypedRateLimitingQueueConfig[string]{
+				Logger: &logger,
+				Name:   "namespace",
+			},
+		),
+		namespacedResourcesDeleter: deletion.NewNamespacedResourcesDeleter(ctx, kubeClient.CoreV1().Namespaces(), metadataClient, kubeClient.CoreV1(), discoverResourcesFn, finalizerToken),
 	}
 
-	if kubeClient != nil && kubeClient.Core().GetRESTClient().GetRateLimiter() != nil {
-		metrics.RegisterMetricAndTrackRateLimiterUsage("namespace_controller", kubeClient.Core().GetRESTClient().GetRateLimiter())
-	}
-
-	// configure the backing store/controller
-	store, controller := cache.NewInformer(
-		&cache.ListWatch{
-			ListFunc: func(options api.ListOptions) (runtime.Object, error) {
-				return kubeClient.Core().Namespaces().List(options)
-			},
-			WatchFunc: func(options api.ListOptions) (watch.Interface, error) {
-				return kubeClient.Core().Namespaces().Watch(options)
-			},
-		},
-		&api.Namespace{},
-		resyncPeriod,
+	// configure the namespace informer event handlers
+	_, _ = namespaceInformer.Informer().AddEventHandlerWithOptions(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(obj interface{}) {
-				namespace := obj.(*api.Namespace)
-				namespaceController.enqueueNamespace(namespace)
+				namespace := obj.(*v1.Namespace)
+				namespaceController.enqueueNamespace(ctx, namespace)
 			},
 			UpdateFunc: func(oldObj, newObj interface{}) {
-				namespace := newObj.(*api.Namespace)
-				namespaceController.enqueueNamespace(namespace)
+				namespace := newObj.(*v1.Namespace)
+				namespaceController.enqueueNamespace(ctx, namespace)
 			},
 		},
+		cache.HandlerOptions{Logger: &logger, ResyncPeriod: &resyncPeriod},
 	)
+	namespaceController.lister = namespaceInformer.Lister()
+	namespaceController.listerSynced = namespaceInformer.Informer().HasSynced
 
-	namespaceController.store = store
-	namespaceController.controller = controller
 	return namespaceController
 }
 
+// nsControllerRateLimiter is tuned for a faster than normal recycle time with default backoff speed and default overall
+// requeing speed.  We do this so that namespace cleanup is reliably faster and we know that the number of namespaces being
+// deleted is smaller than total number of other namespace scoped resources in a cluster.
+func nsControllerRateLimiter() workqueue.TypedRateLimiter[string] {
+	return workqueue.NewTypedMaxOfRateLimiter(
+		// this ensures that we retry namespace deletion at least every minute, never longer.
+		workqueue.NewTypedItemExponentialFailureRateLimiter[string](5*time.Millisecond, 60*time.Second),
+		// 10 qps, 100 bucket size.  This is only for retry speed and its only the overall factor (not per item)
+		&workqueue.TypedBucketRateLimiter[string]{Limiter: rate.NewLimiter(rate.Limit(10), 100)},
+	)
+}
+
 // enqueueNamespace adds an object to the controller work queue
-// obj could be an *api.Namespace, or a DeletionFinalStateUnknown item.
-func (nm *NamespaceController) enqueueNamespace(obj interface{}) {
+// obj could be an *v1.Namespace, or a DeletionFinalStateUnknown item.
+func (nm *NamespaceController) enqueueNamespace(ctx context.Context, obj interface{}) {
 	key, err := controller.KeyFunc(obj)
 	if err != nil {
-		glog.Errorf("Couldn't get key for object %+v: %v", obj, err)
+		utilruntime.HandleErrorWithContext(ctx, err, "Couldn't get key for object", "object", obj)
 		return
 	}
-	nm.queue.Add(key)
+
+	namespace := obj.(*v1.Namespace)
+	// don't queue if we aren't deleted
+	if namespace.DeletionTimestamp == nil || namespace.DeletionTimestamp.IsZero() {
+		return
+	}
+
+	// delay processing namespace events to allow HA api servers to observe namespace deletion,
+	// and HA etcd servers to observe last minute object creations inside the namespace
+	nm.queue.AddAfter(key, namespaceDeletionGracePeriod)
 }
 
 // worker processes the queue of namespace objects.
 // Each namespace can be in the queue at most once.
 // The system ensures that no two workers can process
 // the same namespace at the same time.
-func (nm *NamespaceController) worker() {
-	workFunc := func() bool {
+func (nm *NamespaceController) worker(ctx context.Context) {
+	workFunc := func(ctx context.Context) bool {
 		key, quit := nm.queue.Get()
 		if quit {
 			return true
 		}
 		defer nm.queue.Done(key)
 
-		err := nm.syncNamespaceFromKey(key.(string))
+		err := nm.syncNamespaceFromKey(ctx, key)
 		if err == nil {
 			// no error, forget this entry and return
 			nm.queue.Forget(key)
 			return false
 		}
 
-		if estimate, ok := err.(*contentRemainingError); ok {
+		if estimate, ok := err.(*deletion.ResourcesRemainingError); ok {
 			t := estimate.Estimate/2 + 1
-			glog.V(4).Infof("Content remaining in namespace %s, waiting %d seconds", key, t)
+			klog.FromContext(ctx).V(4).Info("Content remaining in namespace", "namespace", key, "waitSeconds", t)
 			nm.queue.AddAfter(key, time.Duration(t)*time.Second)
 		} else {
 			// rather than wait for a full resync, re-add the namespace to the queue to be processed
 			nm.queue.AddRateLimited(key)
-			utilruntime.HandleError(err)
+			utilruntime.HandleErrorWithContext(ctx, err, "Deletion of namespace failed", "namespace", key)
 		}
 		return false
 	}
-
 	for {
-		quit := workFunc()
+		quit := workFunc(ctx)
 
 		if quit {
 			return
@@ -174,32 +177,49 @@ func (nm *NamespaceController) worker() {
 }
 
 // syncNamespaceFromKey looks for a namespace with the specified key in its store and synchronizes it
-func (nm *NamespaceController) syncNamespaceFromKey(key string) (err error) {
+func (nm *NamespaceController) syncNamespaceFromKey(ctx context.Context, key string) (err error) {
 	startTime := time.Now()
-	defer glog.V(4).Infof("Finished syncing namespace %q (%v)", key, time.Now().Sub(startTime))
+	logger := klog.FromContext(ctx)
+	defer func() {
+		logger.V(4).Info("Finished syncing namespace", "namespace", key, "duration", time.Since(startTime))
+	}()
 
-	obj, exists, err := nm.store.GetByKey(key)
-	if !exists {
-		glog.Infof("Namespace has been deleted %v", key)
+	namespace, err := nm.lister.Get(key)
+	if errors.IsNotFound(err) {
+		logger.Info("Namespace has been deleted", "namespace", key)
 		return nil
 	}
 	if err != nil {
-		glog.Errorf("Unable to retrieve namespace %v from store: %v", key, err)
-		nm.queue.Add(key)
+		utilruntime.HandleErrorWithContext(ctx, err, "Unable to retrieve namespace from store", "namespace", key)
 		return err
 	}
-	namespace := obj.(*api.Namespace)
-	return syncNamespace(nm.kubeClient, nm.clientPool, nm.opCache, nm.groupVersionResources, namespace, nm.finalizerToken)
+	return nm.namespacedResourcesDeleter.Delete(ctx, namespace.Name)
 }
 
 // Run starts observing the system with the specified number of workers.
-func (nm *NamespaceController) Run(workers int, stopCh <-chan struct{}) {
-	defer utilruntime.HandleCrash()
-	go nm.controller.Run(stopCh)
-	for i := 0; i < workers; i++ {
-		go wait.Until(nm.worker, time.Second, stopCh)
+func (nm *NamespaceController) Run(ctx context.Context, workers int) {
+	defer utilruntime.HandleCrashWithContext(ctx)
+
+	logger := klog.FromContext(ctx)
+	logger.Info("Starting namespace controller")
+
+	var wg sync.WaitGroup
+	defer func() {
+		logger.Info("Shutting down namespace controller")
+		nm.queue.ShutDown()
+		wg.Wait()
+	}()
+
+	if !cache.WaitForNamedCacheSyncWithContext(ctx, nm.listerSynced) {
+		return
 	}
-	<-stopCh
-	glog.Infof("Shutting down NamespaceController")
-	nm.queue.ShutDown()
+
+	logger.V(5).Info("Starting workers of namespace controller")
+
+	for i := 0; i < workers; i++ {
+		wg.Go(func() {
+			wait.UntilWithContext(ctx, nm.worker, time.Second)
+		})
+	}
+	<-ctx.Done()
 }

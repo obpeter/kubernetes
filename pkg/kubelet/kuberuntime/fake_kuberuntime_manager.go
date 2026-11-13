@@ -17,115 +17,143 @@ limitations under the License.
 package kuberuntime
 
 import (
-	"io/ioutil"
+	"context"
 	"net/http"
 	"time"
 
-	cadvisorapi "github.com/google/cadvisor/info/v1"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/client/record"
+	cadvisorapi "github.com/google/cadvisor/lib/model"
+	"go.opentelemetry.io/otel/trace"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/component-base/logs/logreduction"
+	internalapi "k8s.io/cri-api/pkg/apis"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/credentialprovider"
-	internalApi "k8s.io/kubernetes/pkg/kubelet/api"
+	"k8s.io/kubernetes/pkg/kubelet/allocation/state"
+	"k8s.io/kubernetes/pkg/kubelet/cm"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/images"
+	imagepullmanager "k8s.io/kubernetes/pkg/kubelet/images/pullmanager"
 	"k8s.io/kubernetes/pkg/kubelet/lifecycle"
-	"k8s.io/kubernetes/pkg/kubelet/network"
+	"k8s.io/kubernetes/pkg/kubelet/logs"
 	proberesults "k8s.io/kubernetes/pkg/kubelet/prober/results"
-	"k8s.io/kubernetes/pkg/types"
-	kubetypes "k8s.io/kubernetes/pkg/types"
-	"k8s.io/kubernetes/pkg/util/flowcontrol"
+	"k8s.io/utils/ptr"
+)
+
+const (
+	fakeSeccompProfileRoot = "/fakeSeccompProfileRoot"
+
+	fakeNodeAllocatableMemory = "32Gi"
+	fakeNodeAllocatableCPU    = "16"
+
+	fakePodLogsDirectory = "/var/log/pods"
 )
 
 type fakeHTTP struct {
-	url string
+	req *http.Request
 	err error
 }
 
-func (f *fakeHTTP) Get(url string) (*http.Response, error) {
-	f.url = url
+func (f *fakeHTTP) Do(req *http.Request) (*http.Response, error) {
+	f.req = req
 	return nil, f.err
 }
 
-// fakeRuntimeHelper implements kubecontainer.RuntimeHelper interfaces for testing purposes.
-type fakeRuntimeHelper struct{}
+type fakePodStateProvider struct {
+	terminated map[types.UID]struct{}
+	removed    map[types.UID]struct{}
+}
 
-func (f *fakeRuntimeHelper) GenerateRunContainerOptions(pod *api.Pod, container *api.Container, podIP string) (*kubecontainer.RunContainerOptions, error) {
-	var opts kubecontainer.RunContainerOptions
-	if len(container.TerminationMessagePath) != 0 {
-		testPodContainerDir, err := ioutil.TempDir("", "fooPodContainerDir")
-		if err != nil {
-			return nil, err
-		}
-		opts.PodContainerDir = testPodContainerDir
+func newFakePodStateProvider() *fakePodStateProvider {
+	return &fakePodStateProvider{
+		terminated: make(map[types.UID]struct{}),
+		removed:    make(map[types.UID]struct{}),
 	}
-	return &opts, nil
 }
 
-func (f *fakeRuntimeHelper) GetClusterDNS(pod *api.Pod) ([]string, []string, error) {
-	return nil, nil, nil
+func (f *fakePodStateProvider) IsPodTerminationRequested(uid types.UID) bool {
+	_, found := f.removed[uid]
+	return found
 }
 
-// This is not used by docker runtime.
-func (f *fakeRuntimeHelper) GeneratePodHostNameAndDomain(pod *api.Pod) (string, string, error) {
-	return "", "", nil
+func (f *fakePodStateProvider) ShouldPodRuntimeBeRemoved(uid types.UID) bool {
+	_, found := f.terminated[uid]
+	return found
 }
 
-func (f *fakeRuntimeHelper) GetPodDir(kubetypes.UID) string {
-	return ""
+func (f *fakePodStateProvider) ShouldPodContentBeRemoved(uid types.UID) bool {
+	_, found := f.removed[uid]
+	return found
 }
 
-func (f *fakeRuntimeHelper) GetExtraSupplementalGroupsForPod(pod *api.Pod) []int64 {
-	return nil
-}
+type fakePodPullingTimeRecorder struct{}
 
-type fakePodGetter struct {
-	pods map[types.UID]*api.Pod
-}
+func (f *fakePodPullingTimeRecorder) RecordImageStartedPulling(podUID types.UID) {}
 
-func newFakePodGetter() *fakePodGetter {
-	return &fakePodGetter{make(map[types.UID]*api.Pod)}
-}
+func (f *fakePodPullingTimeRecorder) RecordImageFinishedPulling(podUID types.UID) {}
 
-func (f *fakePodGetter) GetPodByUID(uid types.UID) (*api.Pod, bool) {
-	pod, found := f.pods[uid]
-	return pod, found
-}
-
-func NewFakeKubeRuntimeManager(runtimeService internalApi.RuntimeService, imageService internalApi.ImageManagerService, machineInfo *cadvisorapi.MachineInfo, networkPlugin network.NetworkPlugin, osInterface kubecontainer.OSInterface) (*kubeGenericRuntimeManager, error) {
-	recorder := &record.FakeRecorder{}
+func newFakeKubeRuntimeManager(ctx context.Context, runtimeService internalapi.RuntimeService, imageService internalapi.ImageManagerService, machineInfo *cadvisorapi.MachineInfo, osInterface kubecontainer.OSInterface, runtimeHelper kubecontainer.RuntimeHelper, tracer trace.Tracer, recorder *record.FakeRecorder) (*kubeGenericRuntimeManager, error) {
+	logger := klog.FromContext(ctx)
 	kubeRuntimeManager := &kubeGenericRuntimeManager{
-		recorder:            recorder,
-		cpuCFSQuota:         false,
-		livenessManager:     proberesults.NewManager(),
-		containerRefManager: kubecontainer.NewRefManager(),
-		machineInfo:         machineInfo,
-		osInterface:         osInterface,
-		networkPlugin:       networkPlugin,
-		runtimeHelper:       &fakeRuntimeHelper{},
-		runtimeService:      runtimeService,
-		imageService:        imageService,
-		keyring:             credentialprovider.NewDockerKeyring(),
+		recorder:           recorder,
+		cpuCFSQuota:        false,
+		cpuCFSQuotaPeriod:  metav1.Duration{Duration: time.Millisecond * 100},
+		livenessManager:    proberesults.NewManager(),
+		startupManager:     proberesults.NewManager(),
+		machineInfo:        machineInfo,
+		osInterface:        osInterface,
+		containerManager:   cm.NewFakeContainerManager(logger),
+		runtimeHelper:      runtimeHelper,
+		runtimeService:     runtimeService,
+		imageService:       imageService,
+		seccompProfileRoot: fakeSeccompProfileRoot,
+		internalLifecycle:  cm.NewFakeInternalContainerLifecycle(),
+		logReduction:       logreduction.NewLogReduction(identicalErrorDelay),
+		logManager:         logs.NewStubContainerLogManager(),
+		podLogsDirectory:   fakePodLogsDirectory,
+		actuatedState:      state.NewStateMemory(logger, nil, KeepOnlyResourceValues),
 	}
 
-	typedVersion, err := runtimeService.Version(kubeRuntimeAPIVersion)
+	// Initialize swap controller availability check (always false for tests)
+	kubeRuntimeManager.getSwapControllerAvailable = func() bool { return false }
+
+	typedVersion, err := runtimeService.Version(ctx, kubeRuntimeAPIVersion)
 	if err != nil {
 		return nil, err
 	}
 
-	kubeRuntimeManager.containerGC = NewContainerGC(runtimeService, newFakePodGetter(), kubeRuntimeManager)
-	kubeRuntimeManager.runtimeName = typedVersion.GetRuntimeName()
+	podStateProvider := newFakePodStateProvider()
+	kubeRuntimeManager.containerGC = newContainerGC(runtimeService, podStateProvider, kubeRuntimeManager, tracer)
+	kubeRuntimeManager.podStateProvider = podStateProvider
+	kubeRuntimeManager.runtimeName = typedVersion.RuntimeName
 	kubeRuntimeManager.imagePuller = images.NewImageManager(
 		kubecontainer.FilterEventRecorder(recorder),
+		&credentialprovider.BasicDockerKeyring{},
 		kubeRuntimeManager,
+		&imagepullmanager.NoopImagePullManager{},
 		flowcontrol.NewBackOff(time.Second, 300*time.Second),
 		false,
-		0, // Disable image pull throttling by setting QPS to 0,
+		ptr.To[int32](0), // No limit on max parallel image pulls,
+		0,                // Disable image pull throttling by setting QPS to 0,
 		0,
+		&fakePodPullingTimeRecorder{},
 	)
 	kubeRuntimeManager.runner = lifecycle.NewHandlerRunner(
 		&fakeHTTP{},
+		kubecontainer.NewCommandRunner(runtimeService),
 		kubeRuntimeManager,
-		kubeRuntimeManager)
+		recorder)
+
+	kubeRuntimeManager.getNodeAllocatable = func() v1.ResourceList {
+		return v1.ResourceList{
+			v1.ResourceMemory: resource.MustParse(fakeNodeAllocatableMemory),
+			v1.ResourceCPU:    resource.MustParse(fakeNodeAllocatableCPU),
+		}
+	}
 
 	return kubeRuntimeManager, nil
 }

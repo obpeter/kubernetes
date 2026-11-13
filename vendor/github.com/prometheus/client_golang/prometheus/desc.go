@@ -1,36 +1,29 @@
+// Copyright 2016 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package prometheus
 
 import (
-	"bytes"
-	"errors"
 	"fmt"
-	"hash/fnv"
-	"regexp"
 	"sort"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
-
+	"github.com/cespare/xxhash/v2"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/model"
+
+	"github.com/prometheus/client_golang/prometheus/internal"
 )
-
-var (
-	metricNameRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_:]*$`)
-	labelNameRE  = regexp.MustCompile("^[a-zA-Z_][a-zA-Z0-9_]*$")
-)
-
-// reservedLabelPrefix is a prefix which is not legal in user-supplied
-// label names.
-const reservedLabelPrefix = "__"
-
-// Labels represents a collection of label name -> value mappings. This type is
-// commonly used with the With(Labels) and GetMetricWith(Labels) methods of
-// metric vector Collectors, e.g.:
-//     myVec.With(Labels{"code": "404", "method": "GET"}).Add(42)
-//
-// The other use-case is the specification of constant label pairs in Opts or to
-// create a Desc.
-type Labels map[string]string
 
 // Desc is the descriptor used by every Prometheus Metric. It is essentially
 // the immutable meta-data of a Metric. The normal Metric implementations
@@ -53,12 +46,14 @@ type Desc struct {
 	fqName string
 	// help provides some helpful information about this metric.
 	help string
+	// unit provides the unit of this metric.
+	unit string
 	// constLabelPairs contains precalculated DTO label pairs based on
 	// the constant labels.
 	constLabelPairs []*dto.LabelPair
-	// VariableLabels contains names of labels for which the metric
-	// maintains variable values.
-	variableLabels []string
+	// variableLabels contains names of labels and normalization function for
+	// which the metric maintains variable values.
+	variableLabels *compiledLabels
 	// id is a hash of the values of the ConstLabels and fqName. This
 	// must be unique among all registered descriptors and can therefore be
 	// used as an identifier of the descriptor.
@@ -67,32 +62,55 @@ type Desc struct {
 	// Help string. Each Desc with the same fqName must have the same
 	// dimHash.
 	dimHash uint64
-	// err is an error that occured during construction. It is reported on
+	// err is an error that occurred during construction. It is reported on
 	// registration time.
 	err error
 }
 
+// DescOpt allows setting optional fields for NewDesc.
+type DescOpt func(*Desc)
+
+// WithUnit sets the unit for a Desc.
+func WithUnit(unit string) DescOpt {
+	return func(d *Desc) {
+		d.unit = unit
+	}
+}
+
 // NewDesc allocates and initializes a new Desc. Errors are recorded in the Desc
 // and will be reported on registration time. variableLabels and constLabels can
-// be nil if no such labels should be set. fqName and help must not be empty.
+// be nil if no such labels should be set. fqName must not be empty.
 //
 // variableLabels only contain the label names. Their label values are variable
 // and therefore not part of the Desc. (They are managed within the Metric.)
 //
 // For constLabels, the label values are constant. Therefore, they are fully
-// specified in the Desc. See the Opts documentation for the implications of
-// constant labels.
+// specified in the Desc. See the Collector example for a usage pattern.
 func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *Desc {
+	return V2.NewDesc(fqName, help, UnconstrainedLabels(variableLabels), constLabels)
+}
+
+// NewDesc allocates and initializes a new Desc. Errors are recorded in the Desc
+// and will be reported on registration time. variableLabels and constLabels can
+// be nil if no such labels should be set. fqName must not be empty.
+//
+// variableLabels only contain the label names and normalization functions. Their
+// label values are variable and therefore not part of the Desc. (They are managed
+// within the Metric.)
+//
+// For constLabels, the label values are constant. Therefore, they are fully
+// specified in the Desc. See the Collector example for a usage pattern.
+func (v2) NewDesc(fqName, help string, variableLabels ConstrainableLabels, constLabels Labels, opts ...DescOpt) *Desc {
 	d := &Desc{
 		fqName:         fqName,
 		help:           help,
-		variableLabels: variableLabels,
+		variableLabels: variableLabels.compile(),
 	}
-	if help == "" {
-		d.err = errors.New("empty help string")
-		return d
+
+	for _, opt := range opts {
+		opt(d)
 	}
-	if !metricNameRE.MatchString(fqName) {
+	if !model.UTF8Validation.IsValidMetricName(fqName) {
 		d.err = fmt.Errorf("%q is not a valid metric name", fqName)
 		return d
 	}
@@ -100,12 +118,12 @@ func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *
 	// their sorted label names) plus the fqName (at position 0).
 	labelValues := make([]string, 1, len(constLabels)+1)
 	labelValues[0] = fqName
-	labelNames := make([]string, 0, len(constLabels)+len(variableLabels))
+	labelNames := make([]string, 0, len(constLabels)+len(d.variableLabels.names))
 	labelNameSet := map[string]struct{}{}
 	// First add only the const label names and sort them...
 	for labelName := range constLabels {
 		if !checkLabelName(labelName) {
-			d.err = fmt.Errorf("%q is not a valid label name", labelName)
+			d.err = fmt.Errorf("%q is not a valid label name for metric %q", labelName, fqName)
 			return d
 		}
 		labelNames = append(labelNames, labelName)
@@ -116,55 +134,57 @@ func NewDesc(fqName, help string, variableLabels []string, constLabels Labels) *
 	for _, labelName := range labelNames {
 		labelValues = append(labelValues, constLabels[labelName])
 	}
+	// Validate the const label values. They can't have a wrong cardinality, so
+	// use in len(labelValues) as expectedNumberOfValues.
+	if err := validateLabelValues(labelValues, len(labelValues)); err != nil {
+		d.err = err
+		return d
+	}
 	// Now add the variable label names, but prefix them with something that
 	// cannot be in a regular label name. That prevents matching the label
 	// dimension with a different mix between preset and variable labels.
-	for _, labelName := range variableLabels {
-		if !checkLabelName(labelName) {
-			d.err = fmt.Errorf("%q is not a valid label name", labelName)
+	for _, label := range d.variableLabels.names {
+		if !checkLabelName(label) {
+			d.err = fmt.Errorf("%q is not a valid label name for metric %q", label, fqName)
 			return d
 		}
-		labelNames = append(labelNames, "$"+labelName)
-		labelNameSet[labelName] = struct{}{}
+		labelNames = append(labelNames, "$"+label)
+		labelNameSet[label] = struct{}{}
 	}
 	if len(labelNames) != len(labelNameSet) {
-		d.err = errors.New("duplicate label names")
+		d.err = fmt.Errorf("duplicate label names in constant and variable labels for metric %q", fqName)
 		return d
 	}
-	h := fnv.New64a()
-	var b bytes.Buffer // To copy string contents into, avoiding []byte allocations.
+
+	xxh := xxhash.New()
 	for _, val := range labelValues {
-		b.Reset()
-		b.WriteString(val)
-		b.WriteByte(separatorByte)
-		h.Write(b.Bytes())
+		xxh.WriteString(val)
+		xxh.Write(separatorByteSlice)
 	}
-	d.id = h.Sum64()
+	d.id = xxh.Sum64()
 	// Sort labelNames so that order doesn't matter for the hash.
 	sort.Strings(labelNames)
-	// Now hash together (in this order) the help string and the sorted
+	// Now hash together (in this order) the help string, the unit string and the sorted
 	// label names.
-	h.Reset()
-	b.Reset()
-	b.WriteString(help)
-	b.WriteByte(separatorByte)
-	h.Write(b.Bytes())
+	xxh.Reset()
+	xxh.WriteString(help)
+	xxh.Write(separatorByteSlice)
+	xxh.WriteString(d.unit)
+	xxh.Write(separatorByteSlice)
 	for _, labelName := range labelNames {
-		b.Reset()
-		b.WriteString(labelName)
-		b.WriteByte(separatorByte)
-		h.Write(b.Bytes())
+		xxh.WriteString(labelName)
+		xxh.Write(separatorByteSlice)
 	}
-	d.dimHash = h.Sum64()
+	d.dimHash = xxh.Sum64()
 
 	d.constLabelPairs = make([]*dto.LabelPair, 0, len(constLabels))
 	for n, v := range constLabels {
 		d.constLabelPairs = append(d.constLabelPairs, &dto.LabelPair{
-			Name:  proto.String(n),
-			Value: proto.String(v),
+			Name:  new(n),
+			Value: new(v),
 		})
 	}
-	sort.Sort(LabelPairSorter(d.constLabelPairs))
+	sort.Sort(internal.LabelPairSorter(d.constLabelPairs))
 	return d
 }
 
@@ -178,6 +198,15 @@ func NewInvalidDesc(err error) *Desc {
 	}
 }
 
+// Err returns an error that occurred during construction, if any.
+//
+// Calling this method is optional. It can be used to detect construction
+// errors early, before invoking other methods on the Desc. If an error is
+// present, later operations may not behave as expected.
+func (d *Desc) Err() error {
+	return d.err
+}
+
 func (d *Desc) String() string {
 	lpStrings := make([]string, 0, len(d.constLabelPairs))
 	for _, lp := range d.constLabelPairs {
@@ -186,16 +215,23 @@ func (d *Desc) String() string {
 			fmt.Sprintf("%s=%q", lp.GetName(), lp.GetValue()),
 		)
 	}
+	vlStrings := []string{}
+	if d.variableLabels != nil {
+		vlStrings = make([]string, 0, len(d.variableLabels.names))
+		for _, vl := range d.variableLabels.names {
+			if fn, ok := d.variableLabels.labelConstraints[vl]; ok && fn != nil {
+				vlStrings = append(vlStrings, fmt.Sprintf("c(%s)", vl))
+			} else {
+				vlStrings = append(vlStrings, vl)
+			}
+		}
+	}
 	return fmt.Sprintf(
-		"Desc{fqName: %q, help: %q, constLabels: {%s}, variableLabels: %v}",
+		"Desc{fqName: %q, help: %q, unit: %q, constLabels: {%s}, variableLabels: {%s}}",
 		d.fqName,
 		d.help,
+		d.unit,
 		strings.Join(lpStrings, ","),
-		d.variableLabels,
+		strings.Join(vlStrings, ","),
 	)
-}
-
-func checkLabelName(l string) bool {
-	return labelNameRE.MatchString(l) &&
-		!strings.HasPrefix(l, reservedLabelPrefix)
 }

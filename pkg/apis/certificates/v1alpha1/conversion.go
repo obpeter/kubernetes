@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,21 +19,39 @@ package v1alpha1
 import (
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 func addConversionFuncs(scheme *runtime.Scheme) error {
-	// Add non-generated conversion functions here. Currently there are none.
-
-	return api.Scheme.AddFieldLabelConversionFunc(SchemeGroupVersion.String(), "CertificateSigningRequest",
+	err := scheme.AddFieldLabelConversionFunc(
+		SchemeGroupVersion.WithKind("ClusterTrustBundle"),
 		func(label, value string) (string, string, error) {
 			switch label {
-			case "metadata.name":
+			case "metadata.name", "spec.signerName":
 				return label, value, nil
 			default:
 				return "", "", fmt.Errorf("field label not supported: %s", label)
 			}
 		},
 	)
+	if err != nil {
+		return fmt.Errorf("while adding ClusterTrustBundle field label conversion func: %w", err)
+	}
+
+	err = scheme.AddFieldLabelConversionFunc(
+		SchemeGroupVersion.WithKind("PodCertificateRequest"),
+		func(label, value string) (string, string, error) {
+			switch label {
+			case "metadata.name", "spec.signerName", "spec.podName", "spec.nodeName":
+				return label, value, nil
+			default:
+				return "", "", fmt.Errorf("field label not supported: %s", label)
+			}
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("while adding PodCertificateRequest field label conversion func: %w", err)
+	}
+
+	return nil
 }

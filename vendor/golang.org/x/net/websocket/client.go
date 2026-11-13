@@ -6,11 +6,12 @@ package websocket
 
 import (
 	"bufio"
-	"crypto/tls"
+	"context"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // DialError is an error that occurs while dialling a websocket server.
@@ -80,34 +81,59 @@ func parseAuthority(location *url.URL) string {
 
 // DialConfig opens a new client connection to a WebSocket with a config.
 func DialConfig(config *Config) (ws *Conn, err error) {
-	var client net.Conn
+	return config.DialContext(context.Background())
+}
+
+// DialContext opens a new client connection to a WebSocket, with context support for timeouts/cancellation.
+func (config *Config) DialContext(ctx context.Context) (*Conn, error) {
 	if config.Location == nil {
 		return nil, &DialError{config, ErrBadWebSocketLocation}
 	}
 	if config.Origin == nil {
 		return nil, &DialError{config, ErrBadWebSocketOrigin}
 	}
-	switch config.Location.Scheme {
-	case "ws":
-		client, err = net.Dial("tcp", parseAuthority(config.Location))
 
-	case "wss":
-		client, err = tls.Dial("tcp", parseAuthority(config.Location), config.TlsConfig)
-
-	default:
-		err = ErrBadScheme
+	dialer := config.Dialer
+	if dialer == nil {
+		dialer = &net.Dialer{}
 	}
+
+	client, err := dialWithDialer(ctx, dialer, config)
 	if err != nil {
-		goto Error
+		return nil, &DialError{config, err}
 	}
 
-	ws, err = NewClient(config, client)
-	if err != nil {
-		client.Close()
-		goto Error
-	}
-	return
+	// Cleanup the connection if we fail to create the websocket successfully
+	success := false
+	defer func() {
+		if !success {
+			_ = client.Close()
+		}
+	}()
 
-Error:
-	return nil, &DialError{config, err}
+	var ws *Conn
+	var wsErr error
+	doneConnecting := make(chan struct{})
+	go func() {
+		defer close(doneConnecting)
+		ws, err = NewClient(config, client)
+		if err != nil {
+			wsErr = &DialError{config, err}
+		}
+	}()
+
+	// The websocket.NewClient() function can block indefinitely, make sure that we
+	// respect the deadlines specified by the context.
+	select {
+	case <-ctx.Done():
+		// Force the pending operations to fail, terminating the pending connection attempt
+		_ = client.SetDeadline(time.Now())
+		<-doneConnecting // Wait for the goroutine that tries to establish the connection to finish
+		return nil, &DialError{config, ctx.Err()}
+	case <-doneConnecting:
+		if wsErr == nil {
+			success = true // Disarm the deferred connection cleanup
+		}
+		return ws, wsErr
+	}
 }

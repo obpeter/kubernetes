@@ -1,5 +1,5 @@
 /*
-Copyright 2016 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,46 +17,27 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/api/v1"
-	"k8s.io/kubernetes/pkg/runtime"
-	versionedwatch "k8s.io/kubernetes/pkg/watch/versioned"
+	certificatesv1alpha1 "k8s.io/api/certificates/v1alpha1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// GroupName is the group name use in this package
+// GroupName is the group name used in this package.
 const GroupName = "certificates.k8s.io"
 
-// SchemeGroupVersion is group version used to register these objects
-var SchemeGroupVersion = unversioned.GroupVersion{Group: GroupName, Version: "v1alpha1"}
-
-// Kind takes an unqualified kind and returns a Group qualified GroupKind
-func Kind(kind string) unversioned.GroupKind {
-	return SchemeGroupVersion.WithKind(kind).GroupKind()
-}
-
-// Resource takes an unqualified resource and returns a Group qualified GroupResource
-func Resource(resource string) unversioned.GroupResource {
-	return SchemeGroupVersion.WithResource(resource).GroupResource()
+// SchemeGroupVersion is the group and version used in this package.
+var SchemeGroupVersion = schema.GroupVersion{
+	Group:   GroupName,
+	Version: "v1alpha1",
 }
 
 var (
-	SchemeBuilder = runtime.NewSchemeBuilder(addKnownTypes, addConversionFuncs)
-	AddToScheme   = SchemeBuilder.AddToScheme
+	localSchemeBuilder = &certificatesv1alpha1.SchemeBuilder
+	AddToScheme        = localSchemeBuilder.AddToScheme
 )
 
-// Adds the list of known types to api.Scheme.
-func addKnownTypes(scheme *runtime.Scheme) error {
-	scheme.AddKnownTypes(SchemeGroupVersion,
-		&CertificateSigningRequest{},
-		&CertificateSigningRequestList{},
-		&v1.ListOptions{},
-		&v1.DeleteOptions{},
-	)
-
-	// Add the watch version that applies
-	versionedwatch.AddToGroupVersion(scheme, SchemeGroupVersion)
-	return nil
+func init() {
+	// We only register manually written functions here. The registration of the
+	// generated functions takes place in the generated files. The separation
+	// makes the code compile even when the generated files are missing.
+	localSchemeBuilder.Register(addDefaultingFuncs, addConversionFuncs)
 }
-
-func (obj *CertificateSigningRequest) GetObjectKind() unversioned.ObjectKind     { return &obj.TypeMeta }
-func (obj *CertificateSigningRequestList) GetObjectKind() unversioned.ObjectKind { return &obj.TypeMeta }

@@ -17,11 +17,14 @@ limitations under the License.
 package registrytest
 
 import (
+	"context"
 	"sync"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/errors"
-	"k8s.io/kubernetes/pkg/watch"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/watch"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
 // NodeRegistry implements node.Registry interface.
@@ -34,21 +37,15 @@ type NodeRegistry struct {
 }
 
 // MakeNodeList constructs api.NodeList from list of node names and a NodeResource.
-func MakeNodeList(nodes []string, nodeResources api.NodeResources) *api.NodeList {
+func MakeNodeList(nodes []string, nodeResources api.ResourceList) *api.NodeList {
 	list := api.NodeList{
 		Items: make([]api.Node, len(nodes)),
 	}
 	for i := range nodes {
 		list.Items[i].Name = nodes[i]
-		list.Items[i].Status.Capacity = nodeResources.Capacity
+		list.Items[i].Status.Capacity = nodeResources
 	}
 	return &list
-}
-
-func NewNodeRegistry(nodes []string, nodeResources api.NodeResources) *NodeRegistry {
-	return &NodeRegistry{
-		Nodes: *MakeNodeList(nodes, nodeResources),
-	}
 }
 
 func (r *NodeRegistry) SetError(err error) {
@@ -57,13 +54,13 @@ func (r *NodeRegistry) SetError(err error) {
 	r.Err = err
 }
 
-func (r *NodeRegistry) ListNodes(ctx api.Context, options *api.ListOptions) (*api.NodeList, error) {
+func (r *NodeRegistry) ListNodes(ctx context.Context, options *metainternalversion.ListOptions) (*api.NodeList, error) {
 	r.Lock()
 	defer r.Unlock()
 	return &r.Nodes, r.Err
 }
 
-func (r *NodeRegistry) CreateNode(ctx api.Context, node *api.Node) error {
+func (r *NodeRegistry) CreateNode(ctx context.Context, node *api.Node) error {
 	r.Lock()
 	defer r.Unlock()
 	r.Node = node.Name
@@ -71,7 +68,7 @@ func (r *NodeRegistry) CreateNode(ctx api.Context, node *api.Node) error {
 	return r.Err
 }
 
-func (r *NodeRegistry) UpdateNode(ctx api.Context, node *api.Node) error {
+func (r *NodeRegistry) UpdateNode(ctx context.Context, node *api.Node) error {
 	r.Lock()
 	defer r.Unlock()
 	for i, item := range r.Nodes.Items {
@@ -83,7 +80,7 @@ func (r *NodeRegistry) UpdateNode(ctx api.Context, node *api.Node) error {
 	return r.Err
 }
 
-func (r *NodeRegistry) GetNode(ctx api.Context, nodeID string) (*api.Node, error) {
+func (r *NodeRegistry) GetNode(ctx context.Context, nodeID string, options *metav1.GetOptions) (*api.Node, error) {
 	r.Lock()
 	defer r.Unlock()
 	if r.Err != nil {
@@ -97,19 +94,21 @@ func (r *NodeRegistry) GetNode(ctx api.Context, nodeID string) (*api.Node, error
 	return nil, errors.NewNotFound(api.Resource("nodes"), nodeID)
 }
 
-func (r *NodeRegistry) DeleteNode(ctx api.Context, nodeID string) error {
+func (r *NodeRegistry) DeleteNode(ctx context.Context, nodeID string) error {
 	r.Lock()
 	defer r.Unlock()
 	var newList []api.Node
 	for _, node := range r.Nodes.Items {
 		if node.Name != nodeID {
-			newList = append(newList, api.Node{ObjectMeta: api.ObjectMeta{Name: node.Name}})
+			newList = append(newList, api.Node{ObjectMeta: metav1.ObjectMeta{Name: node.Name}})
 		}
 	}
 	r.Nodes.Items = newList
 	return r.Err
 }
 
-func (r *NodeRegistry) WatchNodes(ctx api.Context, options *api.ListOptions) (watch.Interface, error) {
+func (r *NodeRegistry) WatchNodes(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	r.Lock()
+	defer r.Unlock()
 	return nil, r.Err
 }

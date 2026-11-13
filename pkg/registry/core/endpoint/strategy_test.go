@@ -1,5 +1,5 @@
 /*
-Copyright 2014 The Kubernetes Authors.
+Copyright 2024 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,22 +17,108 @@ limitations under the License.
 package endpoint
 
 import (
+	"strings"
 	"testing"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	apitesting "k8s.io/kubernetes/pkg/api/testing"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
-func TestSelectableFieldLabelConversions(t *testing.T) {
-	_, fieldsSet, err := EndpointsAttributes(&api.Endpoints{})
-	if err != nil {
-		t.Fatal(err)
+func Test_endpointsWarning(t *testing.T) {
+	tests := []struct {
+		name      string
+		endpoints *api.Endpoints
+		warnings  []string
+	}{
+		{
+			name:      "empty Endpoints",
+			endpoints: &api.Endpoints{},
+			warnings:  nil,
+		},
+		{
+			name: "valid Endpoints",
+			endpoints: &api.Endpoints{
+				Subsets: []api.EndpointSubset{
+					{
+						Addresses: []api.EndpointAddress{
+							{IP: "1.2.3.4"},
+							{IP: "fd00::1234"},
+						},
+					},
+				},
+			},
+			warnings: nil,
+		},
+		{
+			name: "bad Endpoints",
+			endpoints: &api.Endpoints{
+				Subsets: []api.EndpointSubset{
+					{
+						Addresses: []api.EndpointAddress{
+							{IP: "fd00::1234"},
+							{IP: "01.02.03.04"},
+						},
+					},
+					{
+						Addresses: []api.EndpointAddress{
+							{IP: "::ffff:1.2.3.4"},
+						},
+					},
+					{
+						Addresses: []api.EndpointAddress{
+							{IP: "1.2.3.4"},
+						},
+						NotReadyAddresses: []api.EndpointAddress{
+							{IP: "::ffff:1.2.3.4"},
+						},
+					},
+				},
+			},
+			warnings: []string{
+				"subsets[0].addresses[1].ip",
+				"subsets[1].addresses[0].ip",
+				"subsets[2].notReadyAddresses[0].ip",
+			},
+		},
+		{
+			// We don't actually want to let bad IPs through in this case; the
+			// point here is that we trust the Endpoints controller to not do
+			// that, and we're testing that the checks correctly get skipped.
+			name: "bad Endpoints ignored because of label",
+			endpoints: &api.Endpoints{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"endpoints.kubernetes.io/managed-by": "endpoint-controller",
+					},
+				},
+				Subsets: []api.EndpointSubset{
+					{
+						Addresses: []api.EndpointAddress{
+							{IP: "fd00::1234"},
+							{IP: "01.02.03.04"},
+						},
+					},
+				},
+			},
+			warnings: nil,
+		},
 	}
-	apitesting.TestSelectableFieldLabelConversionsOfKind(t,
-		testapi.Default.GroupVersion().String(),
-		"Endpoints",
-		fieldsSet,
-		nil,
-	)
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			warnings := endpointsWarnings(test.endpoints)
+			ok := len(warnings) == len(test.warnings)
+			if ok {
+				for i := range warnings {
+					if !strings.HasPrefix(warnings[i], test.warnings[i]) {
+						ok = false
+						break
+					}
+				}
+			}
+			if !ok {
+				t.Errorf("Expected warnings for %v, got %v", test.warnings, warnings)
+			}
+		})
+	}
 }

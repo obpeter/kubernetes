@@ -21,39 +21,39 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	cadvisorapi "github.com/google/cadvisor/info/v1"
-	cadvisorapiv2 "github.com/google/cadvisor/info/v2"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/resource"
-	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	v1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
+	"k8s.io/ktesting"
+	kubefeatures "k8s.io/kubernetes/pkg/features"
 )
 
 func TestPodResourceLimitsDefaulting(t *testing.T) {
-	cpuCores := resource.MustParse("10")
-	memoryCapacity := resource.MustParse("10Gi")
+	tCtx := ktesting.Init(t)
 	tk := newTestKubelet(t, true)
-	tk.fakeCadvisor.On("VersionInfo").Return(&cadvisorapi.VersionInfo{}, nil)
-	tk.fakeCadvisor.On("MachineInfo").Return(&cadvisorapi.MachineInfo{
-		NumCores:       int(cpuCores.Value()),
-		MemoryCapacity: uint64(memoryCapacity.Value()),
-	}, nil)
-	tk.fakeCadvisor.On("ImagesFsInfo").Return(cadvisorapiv2.FsInfo{}, nil)
-	tk.fakeCadvisor.On("RootFsInfo").Return(cadvisorapiv2.FsInfo{}, nil)
-
-	tk.kubelet.reservation = kubetypes.Reservation{
-		Kubernetes: api.ResourceList{
-			api.ResourceCPU:    resource.MustParse("3"),
-			api.ResourceMemory: resource.MustParse("4Gi"),
-		},
-		System: api.ResourceList{
-			api.ResourceCPU:    resource.MustParse("1"),
-			api.ResourceMemory: resource.MustParse("2Gi"),
+	defer tk.Cleanup()
+	tk.kubelet.nodeLister = &testNodeLister{
+		nodes: []*v1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: string(tk.kubelet.nodeName),
+				},
+				Status: v1.NodeStatus{
+					Allocatable: v1.ResourceList{
+						v1.ResourceCPU:    resource.MustParse("6"),
+						v1.ResourceMemory: resource.MustParse("4Gi"),
+					},
+				},
+			},
 		},
 	}
-
 	cases := []struct {
-		pod      *api.Pod
-		expected *api.Pod
+		pod                      *v1.Pod
+		expected                 *v1.Pod
+		podLevelResourcesEnabled bool
 	}{
 		{
 			pod:      getPod("0", "0"),
@@ -71,31 +71,57 @@ func TestPodResourceLimitsDefaulting(t *testing.T) {
 			pod:      getPod("0", "1Mi"),
 			expected: getPod("6", "1Mi"),
 		},
+		{
+			pod:                      getPodWithPodLevelResources("0", "1Mi", "0", "0"),
+			expected:                 getPodWithPodLevelResources("0", "1Mi", "6", "1Mi"),
+			podLevelResourcesEnabled: true,
+		},
+		{
+			pod:                      getPodWithPodLevelResources("1", "0", "0", "0"),
+			expected:                 getPodWithPodLevelResources("1", "0", "1", "4Gi"),
+			podLevelResourcesEnabled: true,
+		},
+		{
+			pod:                      getPodWithPodLevelResources("1", "1Mi", "", ""),
+			expected:                 getPodWithPodLevelResources("1", "1Mi", "1", "1Mi"),
+			podLevelResourcesEnabled: true,
+		},
+		{
+			pod:                      getPodWithPodLevelResources("1", "5Mi", "0", "1Mi"),
+			expected:                 getPodWithPodLevelResources("1", "5Mi", "1", "1Mi"),
+			podLevelResourcesEnabled: true,
+		},
+		{
+			pod:                      getPodWithPodLevelResources("1", "5Mi", "1", "1Mi"),
+			expected:                 getPodWithPodLevelResources("1", "5Mi", "1", "1Mi"),
+			podLevelResourcesEnabled: true,
+		},
 	}
 	as := assert.New(t)
 	for idx, tc := range cases {
-		actual, _, err := tk.kubelet.defaultPodLimitsForDownwardApi(tc.pod, nil)
-		as.Nil(err, "failed to default pod limits: %v", err)
-		if !api.Semantic.DeepEqual(tc.expected, actual) {
+		featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, kubefeatures.PodLevelResources, tc.podLevelResourcesEnabled)
+		actual, _, err := tk.kubelet.defaultPodLimitsForDownwardAPI(tCtx, tc.pod, nil)
+		as.NoError(err, "failed to default pod limits: %v", err)
+		if !apiequality.Semantic.DeepEqual(tc.expected, actual) {
 			as.Fail("test case [%d] failed.  Expected: %+v, Got: %+v", idx, tc.expected, actual)
 		}
 	}
 }
 
-func getPod(cpuLimit, memoryLimit string) *api.Pod {
-	resources := api.ResourceRequirements{}
+func getPod(cpuLimit, memoryLimit string) *v1.Pod {
+	resources := v1.ResourceRequirements{}
 	if cpuLimit != "" || memoryLimit != "" {
-		resources.Limits = make(api.ResourceList)
+		resources.Limits = make(v1.ResourceList)
 	}
 	if cpuLimit != "" {
-		resources.Limits[api.ResourceCPU] = resource.MustParse(cpuLimit)
+		resources.Limits[v1.ResourceCPU] = resource.MustParse(cpuLimit)
 	}
 	if memoryLimit != "" {
-		resources.Limits[api.ResourceMemory] = resource.MustParse(memoryLimit)
+		resources.Limits[v1.ResourceMemory] = resource.MustParse(memoryLimit)
 	}
-	return &api.Pod{
-		Spec: api.PodSpec{
-			Containers: []api.Container{
+	return &v1.Pod{
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
 				{
 					Name:      "foo",
 					Resources: resources,
@@ -103,4 +129,20 @@ func getPod(cpuLimit, memoryLimit string) *api.Pod {
 			},
 		},
 	}
+}
+
+func getPodWithPodLevelResources(plCPULimit, plMemoryLimit, clCPULimit, clMemoryLimit string) *v1.Pod {
+	pod := getPod(clCPULimit, clMemoryLimit)
+	resources := v1.ResourceRequirements{}
+	if plCPULimit != "" || plMemoryLimit != "" {
+		resources.Limits = make(v1.ResourceList)
+	}
+	if plCPULimit != "" {
+		resources.Limits[v1.ResourceCPU] = resource.MustParse(plCPULimit)
+	}
+	if plMemoryLimit != "" {
+		resources.Limits[v1.ResourceMemory] = resource.MustParse(plMemoryLimit)
+	}
+	pod.Spec.Resources = &resources
+	return pod
 }

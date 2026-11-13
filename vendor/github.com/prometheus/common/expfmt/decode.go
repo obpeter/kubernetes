@@ -14,6 +14,7 @@
 package expfmt
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"math"
@@ -21,8 +22,8 @@ import (
 	"net/http"
 
 	dto "github.com/prometheus/client_model/go"
+	"google.golang.org/protobuf/encoding/protodelim"
 
-	"github.com/matttproud/golang_protobuf_extensions/pbutil"
 	"github.com/prometheus/common/model"
 )
 
@@ -31,6 +32,7 @@ type Decoder interface {
 	Decode(*dto.MetricFamily) error
 }
 
+// DecodeOptions contains options used by the Decoder and in sample extraction.
 type DecodeOptions struct {
 	// Timestamp is added to each value from the stream that has no explicit timestamp set.
 	Timestamp model.Time
@@ -46,10 +48,7 @@ func ResponseFormat(h http.Header) Format {
 		return FmtUnknown
 	}
 
-	const (
-		textType = "text/plain"
-		jsonType = "application/json"
-	)
+	const textType = "text/plain"
 
 	switch mediatype {
 	case ProtoType:
@@ -67,18 +66,12 @@ func ResponseFormat(h http.Header) Format {
 		}
 		return FmtText
 
-	case jsonType:
-		var prometheusAPIVersion string
-
-		if params["schema"] == "prometheus/telemetry" && params["version"] != "" {
-			prometheusAPIVersion = params["version"]
-		} else {
-			prometheusAPIVersion = h.Get("X-Prometheus-API-Version")
-		}
-
-		switch prometheusAPIVersion {
-		case "0.0.2", "":
-			return fmtJSON2
+	case OpenMetricsType:
+		switch params["version"] {
+		case "", OpenMetricsVersion_0_0_1:
+			return FmtOpenMetrics_0_0_1
+		case OpenMetricsVersion_1_0_0:
+			return FmtOpenMetrics_1_0_0
 		default:
 			return FmtUnknown
 		}
@@ -87,60 +80,137 @@ func ResponseFormat(h http.Header) Format {
 	return FmtUnknown
 }
 
-// NewDecoder returns a new decoder based on the given input format.
-// If the input format does not imply otherwise, a text format decoder is returned.
+// NewDecoder returns a new decoder based on the given input format. Metric
+// names are validated based on the provided Format -- if the format requires
+// escaping, traditional Prometheus validity checking is used. Otherwise, names
+// are checked for UTF-8 validity. Supported formats include delimited protobuf,
+// Prometheus text format, and OpenMetrics 0.0.1 / 1.0.0. For historical
+// reasons, this decoder falls back to classic text decoding for other legacy
+// formats, but returns an error for unsupported formats such as OpenMetrics 2.0.
+// This decoder may not support the latest features of Prometheus text format
+// and is not intended for high-performance applications.
+// See: https://github.com/prometheus/common/issues/812
 func NewDecoder(r io.Reader, format Format) Decoder {
-	switch format {
-	case FmtProtoDelim:
-		return &protoDecoder{r: r}
-	case fmtJSON2:
-		return newJSON2Decoder(r)
+	scheme := model.LegacyValidation
+	if format.ToEscapingScheme() == model.NoEscaping {
+		scheme = model.UTF8Validation
 	}
-	return &textDecoder{r: r}
+	switch format.FormatType() {
+	case TypeProtoDelim:
+		return &protoDecoder{r: bufio.NewReader(r), s: scheme}
+	case TypeProtoText, TypeProtoCompact:
+		return &errDecoder{err: fmt.Errorf("format %s not supported for decoding", format)}
+	case TypeOpenMetrics:
+		_, params, err := mime.ParseMediaType(string(format))
+		if err != nil {
+			return &errDecoder{err: fmt.Errorf("format %s not supported for decoding", format)}
+		}
+		switch params["version"] {
+		case "", OpenMetricsVersion_0_0_1, OpenMetricsVersion_1_0_0:
+			return &openMetricsDecoder{p: newOpenMetricsParser(r, scheme)}
+		default:
+			return &errDecoder{err: fmt.Errorf("format %s not supported for decoding", format)}
+		}
+	}
+	return &textDecoder{r: r, s: scheme}
 }
 
 // protoDecoder implements the Decoder interface for protocol buffers.
 type protoDecoder struct {
-	r io.Reader
+	r protodelim.Reader
+	s model.ValidationScheme
 }
 
 // Decode implements the Decoder interface.
 func (d *protoDecoder) Decode(v *dto.MetricFamily) error {
-	_, err := pbutil.ReadDelimited(d.r, v)
-	return err
+	opts := protodelim.UnmarshalOptions{
+		MaxSize: -1,
+	}
+	if err := opts.UnmarshalFrom(d.r, v); err != nil {
+		return err
+	}
+	if !d.s.IsValidMetricName(v.GetName()) {
+		return fmt.Errorf("invalid metric name %q", v.GetName())
+	}
+	for _, m := range v.GetMetric() {
+		if m == nil {
+			continue
+		}
+		for _, l := range m.GetLabel() {
+			if l == nil {
+				continue
+			}
+			if !model.LabelValue(l.GetValue()).IsValid() {
+				return fmt.Errorf("invalid label value %q", l.GetValue())
+			}
+			if !d.s.IsValidLabelName(l.GetName()) {
+				return fmt.Errorf("invalid label name %q", l.GetName())
+			}
+		}
+	}
+	return nil
 }
 
-// textDecoder implements the Decoder interface for the text protcol.
+// errDecoder is an error-state decoder that always returns the same error.
+type errDecoder struct {
+	err error
+}
+
+func (d *errDecoder) Decode(*dto.MetricFamily) error {
+	return d.err
+}
+
+// openMetricsDecoder implements the Decoder interface for the OpenMetrics 1.0 protocol.
+type openMetricsDecoder struct {
+	p   *openMetricsParser
+	err error
+}
+
+// Decode implements the Decoder interface.
+func (d *openMetricsDecoder) Decode(v *dto.MetricFamily) error {
+	if d.err != nil {
+		return d.err
+	}
+	if err := d.p.next(v); err != nil {
+		d.err = err
+		return err
+	}
+	return nil
+}
+
+// textDecoder implements the Decoder interface for the text protocol.
 type textDecoder struct {
 	r    io.Reader
-	p    TextParser
-	fams []*dto.MetricFamily
+	fams map[string]*dto.MetricFamily
+	s    model.ValidationScheme
+	err  error
 }
 
 // Decode implements the Decoder interface.
 func (d *textDecoder) Decode(v *dto.MetricFamily) error {
-	// TODO(fabxc): Wrap this as a line reader to make streaming safer.
-	if len(d.fams) == 0 {
-		// No cached metric families, read everything and parse metrics.
-		fams, err := d.p.TextToMetricFamilies(d.r)
-		if err != nil {
-			return err
-		}
-		if len(fams) == 0 {
-			return io.EOF
-		}
-		d.fams = make([]*dto.MetricFamily, 0, len(fams))
-		for _, f := range fams {
-			d.fams = append(d.fams, f)
+	if d.err == nil {
+		// Read all metrics in one shot.
+		p := NewTextParser(d.s)
+		d.fams, d.err = p.TextToMetricFamilies(d.r)
+		// If we don't get an error, store io.EOF for the end.
+		if d.err == nil {
+			d.err = io.EOF
 		}
 	}
-
-	*v = *d.fams[0]
-	d.fams = d.fams[1:]
-
-	return nil
+	// Pick off one MetricFamily per Decode until there's nothing left.
+	for key, fam := range d.fams {
+		v.Name = fam.Name
+		v.Help = fam.Help
+		v.Type = fam.Type
+		v.Metric = fam.Metric
+		delete(d.fams, key)
+		return nil
+	}
+	return d.err
 }
 
+// SampleDecoder wraps a Decoder to extract samples from the metric families
+// decoded by the wrapped Decoder.
 type SampleDecoder struct {
 	Dec  Decoder
 	Opts *DecodeOptions
@@ -148,37 +218,51 @@ type SampleDecoder struct {
 	f dto.MetricFamily
 }
 
+// Decode calls the Decode method of the wrapped Decoder and then extracts the
+// samples from the decoded MetricFamily into the provided model.Vector.
 func (sd *SampleDecoder) Decode(s *model.Vector) error {
-	if err := sd.Dec.Decode(&sd.f); err != nil {
+	err := sd.Dec.Decode(&sd.f)
+	if err != nil {
 		return err
 	}
-	*s = extractSamples(&sd.f, sd.Opts)
-	return nil
+	*s, err = extractSamples(&sd.f, sd.Opts)
+	return err
 }
 
-// Extract samples builds a slice of samples from the provided metric families.
-func ExtractSamples(o *DecodeOptions, fams ...*dto.MetricFamily) model.Vector {
-	var all model.Vector
+// ExtractSamples builds a slice of samples from the provided metric
+// families. If an error occurs during sample extraction, it continues to
+// extract from the remaining metric families. The returned error is the last
+// error that has occurred.
+func ExtractSamples(o *DecodeOptions, fams ...*dto.MetricFamily) (model.Vector, error) {
+	var (
+		all     model.Vector
+		lastErr error
+	)
 	for _, f := range fams {
-		all = append(all, extractSamples(f, o)...)
+		some, err := extractSamples(f, o)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		all = append(all, some...)
 	}
-	return all
+	return all, lastErr
 }
 
-func extractSamples(f *dto.MetricFamily, o *DecodeOptions) model.Vector {
+func extractSamples(f *dto.MetricFamily, o *DecodeOptions) (model.Vector, error) {
 	switch f.GetType() {
 	case dto.MetricType_COUNTER:
-		return extractCounter(o, f)
+		return extractCounter(o, f), nil
 	case dto.MetricType_GAUGE:
-		return extractGauge(o, f)
+		return extractGauge(o, f), nil
 	case dto.MetricType_SUMMARY:
-		return extractSummary(o, f)
+		return extractSummary(o, f), nil
 	case dto.MetricType_UNTYPED:
-		return extractUntyped(o, f)
-	case dto.MetricType_HISTOGRAM:
-		return extractHistogram(o, f)
+		return extractUntyped(o, f), nil
+	case dto.MetricType_HISTOGRAM, dto.MetricType_GAUGE_HISTOGRAM:
+		return extractHistogram(o, f), nil
 	}
-	panic("expfmt.extractSamples: unknown metric family type")
+	return nil, fmt.Errorf("expfmt.extractSamples: unknown metric family type %v", f.GetType())
 }
 
 func extractCounter(o *DecodeOptions, f *dto.MetricFamily) model.Vector {
@@ -358,9 +442,13 @@ func extractHistogram(o *DecodeOptions, f *dto.MetricFamily) model.Vector {
 				infSeen = true
 			}
 
+			v := q.GetCumulativeCountFloat()
+			if v <= 0 {
+				v = float64(q.GetCumulativeCount())
+			}
 			samples = append(samples, &model.Sample{
 				Metric:    model.Metric(lset),
-				Value:     model.SampleValue(q.GetCumulativeCount()),
+				Value:     model.SampleValue(v),
 				Timestamp: timestamp,
 			})
 		}
@@ -383,9 +471,13 @@ func extractHistogram(o *DecodeOptions, f *dto.MetricFamily) model.Vector {
 		}
 		lset[model.MetricNameLabel] = model.LabelValue(f.GetName() + "_count")
 
+		v := m.Histogram.GetSampleCountFloat()
+		if v <= 0 {
+			v = float64(m.Histogram.GetSampleCount())
+		}
 		count := &model.Sample{
 			Metric:    model.Metric(lset),
-			Value:     model.SampleValue(m.Histogram.GetSampleCount()),
+			Value:     model.SampleValue(v),
 			Timestamp: timestamp,
 		}
 		samples = append(samples, count)

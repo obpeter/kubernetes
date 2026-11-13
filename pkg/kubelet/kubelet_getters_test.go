@@ -17,163 +17,301 @@ limitations under the License.
 package kubelet
 
 import (
-	"fmt"
-	"os"
-	"path"
+	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	cloudproviderapi "k8s.io/cloud-provider/api"
+	"k8s.io/klog/v2/ktesting"
+	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 )
 
 func TestKubeletDirs(t *testing.T) {
 	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
 	kubelet := testKubelet.kubelet
 	root := kubelet.rootDirectory
 
 	var exp, got string
 
 	got = kubelet.getPodsDir()
-	exp = path.Join(root, "pods")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "pods")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getPodLogsDir()
+	assert.Equal(t, kubelet.podLogsDirectory, got)
 
 	got = kubelet.getPluginsDir()
-	exp = path.Join(root, "plugins")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "plugins")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getPluginsRegistrationDir()
+	exp = filepath.Join(root, "plugins_registry")
+	assert.Equal(t, exp, got)
 
 	got = kubelet.getPluginDir("foobar")
-	exp = path.Join(root, "plugins/foobar")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "plugins/foobar")
+	assert.Equal(t, exp, got)
 
 	got = kubelet.getPodDir("abc123")
-	exp = path.Join(root, "pods/abc123")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "pods/abc123")
+	assert.Equal(t, exp, got)
 
 	got = kubelet.getPodVolumesDir("abc123")
-	exp = path.Join(root, "pods/abc123/volumes")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "pods/abc123/volumes")
+	assert.Equal(t, exp, got)
 
 	got = kubelet.getPodVolumeDir("abc123", "plugin", "foobar")
-	exp = path.Join(root, "pods/abc123/volumes/plugin/foobar")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "pods/abc123/volumes/plugin/foobar")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getPodVolumeDevicesDir("abc123")
+	exp = filepath.Join(root, "pods/abc123/volumeDevices")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getPodVolumeDeviceDir("abc123", "plugin")
+	exp = filepath.Join(root, "pods/abc123/volumeDevices/plugin")
+	assert.Equal(t, exp, got)
 
 	got = kubelet.getPodPluginsDir("abc123")
-	exp = path.Join(root, "pods/abc123/plugins")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "pods/abc123/plugins")
+	assert.Equal(t, exp, got)
 
 	got = kubelet.getPodPluginDir("abc123", "foobar")
-	exp = path.Join(root, "pods/abc123/plugins/foobar")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "pods/abc123/plugins/foobar")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getVolumeDevicePluginsDir()
+	exp = filepath.Join(root, "plugins")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getVolumeDevicePluginDir("foobar")
+	exp = filepath.Join(root, "plugins", "foobar", "volumeDevices")
+	assert.Equal(t, exp, got)
 
 	got = kubelet.getPodContainerDir("abc123", "def456")
-	exp = path.Join(root, "pods/abc123/containers/def456")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
+	exp = filepath.Join(root, "pods/abc123/containers/def456")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getPodResourcesDir()
+	exp = filepath.Join(root, "pod-resources")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getPodsAPIDir()
+	exp = filepath.Join(root, "pods-api")
+	assert.Equal(t, exp, got)
+
+	got = kubelet.getPodVolumeSubpathsDir("abc123")
+	exp = filepath.Join(root, "pods/abc123/volume-subpaths")
+	assert.Equal(t, exp, got)
 }
 
-func TestKubeletDirsCompat(t *testing.T) {
+func TestHandlerSupportsUserNamespaces(t *testing.T) {
 	testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+	defer testKubelet.Cleanup()
 	kubelet := testKubelet.kubelet
-	root := kubelet.rootDirectory
-	if err := os.MkdirAll(root, 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
+
+	kubelet.runtimeState.setRuntimeHandlers([]kubecontainer.RuntimeHandler{
+		{
+			Name:                   "has-support",
+			SupportsUserNamespaces: true,
+		},
+		{
+			Name:                   "has-no-support",
+			SupportsUserNamespaces: false,
+		},
+	})
+
+	got, err := kubelet.HandlerSupportsUserNamespaces("has-support")
+	assert.True(t, got)
+	assert.NoError(t, err)
+
+	got, err = kubelet.HandlerSupportsUserNamespaces("has-no-support")
+	assert.False(t, got)
+	assert.NoError(t, err)
+
+	got, err = kubelet.HandlerSupportsUserNamespaces("unknown")
+	assert.False(t, got)
+	assert.Error(t, err)
+}
+
+func Test_getLastObservedNodeAddresses(t *testing.T) {
+	testCases := []struct {
+		name                  string
+		nodeName              types.NodeName
+		node                  *v1.Node
+		externalCloudProvider bool
+		expectedAddrs         []v1.NodeAddress
+	}{
+		{
+			name:          "node not found",
+			nodeName:      "test-node",
+			node:          nil,
+			expectedAddrs: nil,
+		},
+		{
+			name:     "empty addresses",
+			nodeName: "test-node",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Status:     v1.NodeStatus{Addresses: []v1.NodeAddress{}},
+			},
+			expectedAddrs: nil,
+		},
+		{
+			name:     "no taints",
+			nodeName: "test-node",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+						{Type: v1.NodeHostName, Address: "test-node"},
+					},
+				},
+			},
+			expectedAddrs: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeHostName, Address: "test-node"},
+			},
+		},
+		{
+			name:     "other taints",
+			nodeName: "test-node",
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{Key: "other-taint", Effect: v1.TaintEffectNoSchedule},
+					},
+				},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+						{Type: v1.NodeHostName, Address: "test-node"},
+					},
+				},
+			},
+			expectedAddrs: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeHostName, Address: "test-node"},
+			},
+		},
+		{
+			name:                  "external cloud provider no taints",
+			nodeName:              "test-node",
+			externalCloudProvider: true,
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+						{Type: v1.NodeHostName, Address: "test-node"},
+					},
+				},
+			},
+			expectedAddrs: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeHostName, Address: "test-node"},
+			},
+		},
+		{
+			name:                  "no external cloud provider with external cloud provider taint",
+			nodeName:              "test-node",
+			externalCloudProvider: false,
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{Key: cloudproviderapi.TaintExternalCloudProvider, Effect: v1.TaintEffectNoSchedule},
+					},
+				},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+						{Type: v1.NodeHostName, Address: "test-node"},
+					},
+				},
+			},
+			expectedAddrs: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeHostName, Address: "test-node"},
+			},
+		},
+		{
+			name:                  "external cloud provider taint",
+			nodeName:              "test-node",
+			externalCloudProvider: true,
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{Key: cloudproviderapi.TaintExternalCloudProvider, Effect: v1.TaintEffectNoSchedule},
+					},
+				},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+						{Type: v1.NodeHostName, Address: "test-node"},
+					},
+				},
+			},
+			expectedAddrs: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeHostName, Address: "test-node"},
+			}},
+		{
+			name:                  "external cloud provider other taint",
+			nodeName:              "test-node",
+			externalCloudProvider: true,
+			node: &v1.Node{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+				Spec: v1.NodeSpec{
+					Taints: []v1.Taint{
+						{Key: "other-taint", Effect: v1.TaintEffectNoSchedule},
+					},
+				},
+				Status: v1.NodeStatus{
+					Addresses: []v1.NodeAddress{
+						{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+						{Type: v1.NodeHostName, Address: "test-node"},
+					},
+				},
+			},
+			expectedAddrs: []v1.NodeAddress{
+				{Type: v1.NodeInternalIP, Address: "10.0.0.1"},
+				{Type: v1.NodeHostName, Address: "test-node"},
+			},
+		},
 	}
 
-	var exp, got string
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, ctx := ktesting.NewTestContext(t)
+			testKubelet := newTestKubelet(t, false /* controllerAttachDetachEnabled */)
+			defer testKubelet.Cleanup()
+			kl := testKubelet.kubelet
+			kl.nodeName = types.NodeName(tc.nodeName)
+			kl.externalCloudProvider = tc.externalCloudProvider
+			nodeLister := testNodeLister{}
+			if tc.node != nil {
+				nodeLister.nodes = append(nodeLister.nodes, tc.node)
+			}
+			kl.nodeLister = nodeLister
+			addrs := kl.getLastObservedNodeAddresses(ctx)
 
-	// Old-style pod dir.
-	if err := os.MkdirAll(fmt.Sprintf("%s/oldpod", root), 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
-	}
-	// New-style pod dir.
-	if err := os.MkdirAll(fmt.Sprintf("%s/pods/newpod", root), 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
-	}
-	// Both-style pod dir.
-	if err := os.MkdirAll(fmt.Sprintf("%s/bothpod", root), 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
-	}
-	if err := os.MkdirAll(fmt.Sprintf("%s/pods/bothpod", root), 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
-	}
-
-	got = kubelet.getPodDir("oldpod")
-	exp = path.Join(root, "oldpod")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
-
-	got = kubelet.getPodDir("newpod")
-	exp = path.Join(root, "pods/newpod")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
-
-	got = kubelet.getPodDir("bothpod")
-	exp = path.Join(root, "pods/bothpod")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
-
-	got = kubelet.getPodDir("neitherpod")
-	exp = path.Join(root, "pods/neitherpod")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
-
-	root = kubelet.getPodDir("newpod")
-
-	// Old-style container dir.
-	if err := os.MkdirAll(fmt.Sprintf("%s/oldctr", root), 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
-	}
-	// New-style container dir.
-	if err := os.MkdirAll(fmt.Sprintf("%s/containers/newctr", root), 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
-	}
-	// Both-style container dir.
-	if err := os.MkdirAll(fmt.Sprintf("%s/bothctr", root), 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
-	}
-	if err := os.MkdirAll(fmt.Sprintf("%s/containers/bothctr", root), 0750); err != nil {
-		t.Fatalf("can't mkdir(%q): %s", root, err)
-	}
-
-	got = kubelet.getPodContainerDir("newpod", "oldctr")
-	exp = path.Join(root, "oldctr")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
-
-	got = kubelet.getPodContainerDir("newpod", "newctr")
-	exp = path.Join(root, "containers/newctr")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
-
-	got = kubelet.getPodContainerDir("newpod", "bothctr")
-	exp = path.Join(root, "containers/bothctr")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
-	}
-
-	got = kubelet.getPodContainerDir("newpod", "neitherctr")
-	exp = path.Join(root, "containers/neitherctr")
-	if got != exp {
-		t.Errorf("expected %q', got %q", exp, got)
+			if len(addrs) != len(tc.expectedAddrs) {
+				t.Errorf("expected %d addresses, got %d", len(tc.expectedAddrs), len(addrs))
+			} else {
+				for i := range addrs {
+					if addrs[i] != tc.expectedAddrs[i] {
+						t.Errorf("expected address %v, got %v", tc.expectedAddrs[i], addrs[i])
+					}
+				}
+			}
+		})
 	}
 }

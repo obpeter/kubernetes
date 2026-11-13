@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -14,8 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+function kube::util::sourced_variable {
+  # Call this function to tell shellcheck that a variable is supposed to
+  # be used from other calling context. This helps quiet an "unused
+  # variable" warning from shellcheck and also document your code.
+  true
+}
+
 kube::util::sortable_date() {
   date "+%Y%m%d-%H%M%S"
+}
+
+# arguments: target, item1, item2, item3, ...
+# returns 0 if target is in the given items, 1 otherwise.
+kube::util::array_contains() {
+  local search="$1"
+  local element
+  shift
+  for element; do
+    if [[ "${element}" == "${search}" ]]; then
+      return 0
+     fi
+  done
+  return 1
 }
 
 kube::util::wait_for_url() {
@@ -23,49 +44,53 @@ kube::util::wait_for_url() {
   local prefix=${2:-}
   local wait=${3:-1}
   local times=${4:-30}
+  local maxtime=${5:-1}
 
-  which curl >/dev/null || {
+  command -v curl >/dev/null || {
     kube::log::usage "curl must be installed"
     exit 1
   }
 
   local i
-  for i in $(seq 1 $times); do
+  for i in $(seq 1 "${times}"); do
     local out
-    if out=$(curl -gfs $url 2>/dev/null); then
+    if out=$(curl --max-time "${maxtime}" -gkfs "${@:6}" "${url}" 2>/dev/null); then
       kube::log::status "On try ${i}, ${prefix}: ${out}"
       return 0
     fi
-    sleep ${wait}
+    sleep "${wait}"
   done
   kube::log::error "Timed out waiting for ${prefix} to answer at ${url}; tried ${times} waiting ${wait} between each"
   return 1
 }
 
-# returns a random port
-kube::util::get_random_port() {
-  awk -v min=1024 -v max=65535 'BEGIN{srand(); print int(min+rand()*(max-min+1))}'
+kube::util::wait_for_url_with_bearer_token() {
+  local url=$1
+  local token=$2
+  local prefix=${3:-}
+  local wait=${4:-1}
+  local times=${5:-30}
+  local maxtime=${6:-1}
+
+  kube::util::wait_for_url "${url}" "${prefix}" "${wait}" "${times}" "${maxtime}" -H "Authorization: Bearer ${token}"
 }
 
-# use netcat to check if the host($1):port($2) is free (return 0 means free, 1 means used)
-kube::util::test_host_port_free() {
-  local host=$1
-  local port=$2
-  local success=0
-  local fail=1
-
-  which nc >/dev/null || {
-    kube::log::usage "netcat isn't installed, can't verify if ${host}:${port} is free, skipping the check..."
-    return ${success}
-  }
-
-  if [ ! $(nc -vz "${host}" "${port}") ]; then
-    kube::log::status "${host}:${port} is free, proceeding..."
-    return ${success}
-  else
-    kube::log::status "${host}:${port} is already used"
-    return ${fail}
-  fi
+# Example:  kube::util::wait_for_success 120 5 "kubectl get nodes|grep localhost"
+# arguments: wait time, sleep time, shell command
+# returns 0 if the shell command get output, 1 otherwise.
+kube::util::wait_for_success(){
+  local wait_time="$1"
+  local sleep_time="$2"
+  local cmd="$3"
+  while [ "$wait_time" -gt 0 ]; do
+    if eval "$cmd"; then
+      return 0
+    else
+      sleep "$sleep_time"
+      wait_time=$((wait_time-sleep_time))
+    fi
+  done
+  return 1
 }
 
 # Example:  kube::util::trap_add 'echo "in trap DEBUG"' DEBUG
@@ -80,15 +105,19 @@ kube::util::trap_add() {
     local new_cmd
 
     # Grab the currently defined trap commands for this trap
-    existing_cmd=`trap -p "${trap_add_name}" |  awk -F"'" '{print $2}'`
+    existing_cmd=$(trap -p "${trap_add_name}" |  awk -F"'" '{print $2}')
 
     if [[ -z "${existing_cmd}" ]]; then
       new_cmd="${trap_add_cmd}"
     else
-      new_cmd="${existing_cmd};${trap_add_cmd}"
+      new_cmd="${trap_add_cmd};${existing_cmd}"
     fi
 
-    # Assign the test
+    # Assign the test. Disable the shellcheck warning telling that trap
+    # commands should be single quoted to avoid evaluating them at this
+    # point instead evaluating them at run time. The logic of adding new
+    # commands to a single trap requires them to be evaluated right away.
+    # shellcheck disable=SC2064
     trap "${new_cmd}" "${trap_add_name}"
   done
 }
@@ -109,12 +138,8 @@ kube::util::ensure-temp-dir() {
   fi
 }
 
-# This figures out the host platform without relying on golang.  We need this as
-# we don't want a golang install to be a prerequisite to building yet we need
-# this info to figure out where the final binaries are placed.
-kube::util::host_platform() {
+kube::util::host_os() {
   local host_os
-  local host_arch
   case "$(uname -s)" in
     Darwin)
       host_os=darwin
@@ -127,7 +152,11 @@ kube::util::host_platform() {
       exit 1
       ;;
   esac
+  echo "${host_os}"
+}
 
+kube::util::host_arch() {
+  local host_arch
   case "$(uname -m)" in
     x86_64*)
       host_arch=amd64
@@ -161,141 +190,57 @@ kube::util::host_platform() {
       exit 1
       ;;
   esac
-  echo "${host_os}/${host_arch}"
+  echo "${host_arch}"
 }
 
+# This figures out the host platform without relying on golang.  We need this as
+# we don't want a golang install to be a prerequisite to building yet we need
+# this info to figure out where the final binaries are placed.
+kube::util::host_platform() {
+  echo "$(kube::util::host_os)/$(kube::util::host_arch)"
+}
+
+# looks for $1 in well-known output locations for the platform ($2)
+# $KUBE_ROOT must be set
 kube::util::find-binary-for-platform() {
   local -r lookfor="$1"
   local -r platform="$2"
-  local -r locations=(
+  local locations=(
     "${KUBE_ROOT}/_output/bin/${lookfor}"
     "${KUBE_ROOT}/_output/dockerized/bin/${platform}/${lookfor}"
     "${KUBE_ROOT}/_output/local/bin/${platform}/${lookfor}"
     "${KUBE_ROOT}/platforms/${platform}/${lookfor}"
   )
+
+  # if we're looking for the host platform, add local non-platform-qualified search paths
+  if [[ "${platform}" = "$(kube::util::host_platform)" ]]; then
+    locations+=(
+      "${KUBE_ROOT}/_output/local/go/bin/${lookfor}"
+      "${KUBE_ROOT}/_output/dockerized/go/bin/${lookfor}"
+    );
+  fi
+
+  # looks for $1 in the $PATH
+  if which "${lookfor}" >/dev/null; then
+    local -r local_bin="$(which "${lookfor}")"
+    locations+=( "${local_bin}"  );
+  fi
+
+  # List most recently-updated location.
   local -r bin=$( (ls -t "${locations[@]}" 2>/dev/null || true) | head -1 )
+
+  if [[ -z "${bin}" ]]; then
+    kube::log::error "Failed to find binary ${lookfor} for platform ${platform}"
+    return 1
+  fi
+
   echo -n "${bin}"
 }
 
+# looks for $1 in well-known output locations for the host platform
+# $KUBE_ROOT must be set
 kube::util::find-binary() {
   kube::util::find-binary-for-platform "$1" "$(kube::util::host_platform)"
-}
-
-# Run all known doc generators (today gendocs and genman for kubectl)
-# $1 is the directory to put those generated documents
-kube::util::gen-docs() {
-  local dest="$1"
-
-  # Find binary
-  gendocs=$(kube::util::find-binary "gendocs")
-  genkubedocs=$(kube::util::find-binary "genkubedocs")
-  genman=$(kube::util::find-binary "genman")
-  genyaml=$(kube::util::find-binary "genyaml")
-  genfeddocs=$(kube::util::find-binary "genfeddocs")
-
-  mkdir -p "${dest}/docs/user-guide/kubectl/"
-  "${gendocs}" "${dest}/docs/user-guide/kubectl/"
-  mkdir -p "${dest}/docs/admin/"
-  "${genkubedocs}" "${dest}/docs/admin/" "kube-apiserver"
-  "${genkubedocs}" "${dest}/docs/admin/" "kube-controller-manager"
-  "${genkubedocs}" "${dest}/docs/admin/" "kube-proxy"
-  "${genkubedocs}" "${dest}/docs/admin/" "kube-scheduler"
-  "${genkubedocs}" "${dest}/docs/admin/" "kubelet"
-
-  # We don't really need federation-apiserver and federation-controller-manager
-  # binaries to generate the docs. We just pass their names to decide which docs
-  # to generate. The actual binary for running federation is hyperkube.
-  "${genfeddocs}" "${dest}/docs/admin/" "federation-apiserver"
-  "${genfeddocs}" "${dest}/docs/admin/" "federation-controller-manager"
-
-  mkdir -p "${dest}/docs/man/man1/"
-  "${genman}" "${dest}/docs/man/man1/" "kube-apiserver"
-  "${genman}" "${dest}/docs/man/man1/" "kube-controller-manager"
-  "${genman}" "${dest}/docs/man/man1/" "kube-proxy"
-  "${genman}" "${dest}/docs/man/man1/" "kube-scheduler"
-  "${genman}" "${dest}/docs/man/man1/" "kubelet"
-  "${genman}" "${dest}/docs/man/man1/" "kubectl"
-
-  mkdir -p "${dest}/docs/yaml/kubectl/"
-  "${genyaml}" "${dest}/docs/yaml/kubectl/"
-
-  # create the list of generated files
-  pushd "${dest}" > /dev/null
-  touch .generated_docs
-  find . -type f | cut -sd / -f 2- | LC_ALL=C sort > .generated_docs
-  popd > /dev/null
-}
-
-# Puts a placeholder for every generated doc. This makes the link checker work.
-kube::util::set-placeholder-gen-docs() {
-  local list_file="${KUBE_ROOT}/.generated_docs"
-  if [ -e ${list_file} ]; then
-    # remove all of the old docs; we don't want to check them in.
-    while read file; do
-      if [[ "${list_file}" != "${KUBE_ROOT}/${file}" ]]; then
-        cp "${KUBE_ROOT}/hack/autogenerated_placeholder.txt" "${KUBE_ROOT}/${file}"
-      fi
-    done <"${list_file}"
-    # The .generated_docs file lists itself, so we don't need to explicitly
-    # delete it.
-  fi
-}
-
-# Removes previously generated docs-- we don't want to check them in. $KUBE_ROOT
-# must be set.
-kube::util::remove-gen-docs() {
-  if [ -e "${KUBE_ROOT}/.generated_docs" ]; then
-    # remove all of the old docs; we don't want to check them in.
-    while read file; do
-      rm "${KUBE_ROOT}/${file}" 2>/dev/null || true
-    done <"${KUBE_ROOT}/.generated_docs"
-    # The .generated_docs file lists itself, so we don't need to explicitly
-    # delete it.
-  fi
-}
-
-# Takes a path $1 to traverse for md files to append the ga-beacon tracking
-# link to, if needed. If $2 is set, just print files that are missing
-# the link.
-kube::util::gen-analytics() {
-  local path="$1"
-  local dryrun="${2:-}"
-  local mdfiles dir link
-  # find has some strange inconsistencies between darwin/linux. The
-  # path to search must end in '/' for linux, but darwin will put an extra
-  # slash in results if there is a trailing '/'.
-  if [[ $( uname ) == 'Linux' ]]; then
-    dir="${path}/"
-  else
-    dir="${path}"
-  fi
-  # We don't touch files in special dirs, and the kubectl docs are
-  # autogenerated by gendocs.
-  # Don't descend into .directories
-  mdfiles=($( find "${dir}" -name "*.md" -type f \
-              -not -path '*/\.*' \
-              -not -path "${path}/vendor/*" \
-              -not -path "${path}/staging/*" \
-              -not -path "${path}/third_party/*" \
-              -not -path "${path}/_gopath/*" \
-              -not -path "${path}/_output/*" \
-              -not -path "${path}/docs/user-guide/kubectl/kubectl*" ))
-  for f in "${mdfiles[@]}"; do
-    link=$(kube::util::analytics-link "${f#${path}/}")
-    if grep -q -F -x "${link}" "${f}"; then
-      continue
-    elif [[ -z "${dryrun}" ]]; then
-      echo -e "\n\n${link}" >> "${f}"
-    else
-      echo "$f"
-    fi
-  done
-}
-
-# Prints analytics link to append to a file at path $1.
-kube::util::analytics-link() {
-  local path="$1"
-  echo "[![Analytics](https://kubernetes-site.appspot.com/UA-36037335-10/GitHub/${path}?pixel)]()"
 }
 
 # Takes a group/version and returns the path to its location on disk, sans
@@ -305,30 +250,61 @@ kube::util::analytics-link() {
 # * Special handling for empty group: v1 -> api/v1, unversioned -> api/unversioned
 # * Special handling for groups suffixed with ".k8s.io": foo.k8s.io/v1 -> apis/foo/v1
 # * Very special handling for when both group and version are "": / -> api
+#
+# $KUBE_ROOT must be set.
 kube::util::group-version-to-pkg-path() {
   local group_version="$1"
+
+  # Make a list of all know APIs by listing their dirs.
+  local apidirs=()
+  kube::util::read-array apidirs < <(
+      cd "${KUBE_ROOT}/staging/src/k8s.io/api" || return 1 # make shellcheck happy
+      find . -name types.go -exec dirname {} \; \
+        | sed "s|\./||g" \
+        | LC_ALL=C sort -u)
+
+  # Compare each API dir against the requested GV, and if we find it, no
+  # special handling needed.
+  for api in "${apidirs[@]}"; do
+    # Change "foo.bar.k8s.io/v1" -> "foo/v1" notation.
+    local simple_gv="${group_version/.*k8s.io/}"
+    if [[ "${api}" = "${simple_gv}" ]]; then
+      echo "staging/src/k8s.io/api/${simple_gv}"
+      return
+    fi
+  done
+
+  # "v1" is the API GroupVersion
+  if [[ "${group_version}" == "v1" ]]; then
+    echo "staging/src/k8s.io/api/core/v1"
+    return
+  fi
+
   # Special cases first.
   # TODO(lavalamp): Simplify this by moving pkg/api/v1 and splitting pkg/api,
   # moving the results to pkg/apis/api.
   case "${group_version}" in
     # both group and version are "", this occurs when we generate deep copies for internal objects of the legacy v1 API.
     __internal)
-      echo "api"
+      echo "pkg/apis/core"
       ;;
-    v1)
-      echo "api/v1"
+    meta/v1)
+      echo "staging/src/k8s.io/apimachinery/pkg/apis/meta/v1"
       ;;
-    unversioned)
-      echo "api/unversioned"
+    meta/v1beta1)
+      echo "staging/src/k8s.io/apimachinery/pkg/apis/meta/v1beta1"
+      ;;
+    internal.apiserver.k8s.io/v1alpha1)
+      echo "staging/src/k8s.io/api/apiserverinternal/v1alpha1"
       ;;
     *.k8s.io)
-      echo "apis/${group_version%.*k8s.io}"
+      echo "pkg/apis/${group_version%.*k8s.io}"
       ;;
     *.k8s.io/*)
-      echo "apis/${group_version/.*k8s.io/}"
+      echo "pkg/apis/${group_version/.*k8s.io/}"
       ;;
     *)
-      echo "apis/${group_version%__internal}"
+      echo "pkg/apis/${group_version%__internal}"
       ;;
   esac
 }
@@ -348,99 +324,6 @@ kube::util::gv-to-swagger-name() {
   esac
 }
 
-
-# Fetches swagger spec from apiserver.
-# Assumed vars:
-# SWAGGER_API_PATH: Base path for swaggerapi on apiserver. Ex:
-# http://localhost:8080/swaggerapi.
-# SWAGGER_ROOT_DIR: Root dir where we want to to save the fetched spec.
-# VERSIONS: Array of group versions to include in swagger spec.
-kube::util::fetch-swagger-spec() {
-  for ver in ${VERSIONS}; do
-    if [[ " ${KUBE_NONSERVER_GROUP_VERSIONS} " == *" ${ver} "* ]]; then
-      continue
-    fi
-    # fetch the swagger spec for each group version.
-    if [[ ${ver} == "v1" ]]; then
-      SUBPATH="api"
-    else
-      SUBPATH="apis"
-    fi
-    SUBPATH="${SUBPATH}/${ver}"
-    SWAGGER_JSON_NAME="$(kube::util::gv-to-swagger-name ${ver}).json"
-    curl -w "\n" -fs "${SWAGGER_API_PATH}${SUBPATH}" > "${SWAGGER_ROOT_DIR}/${SWAGGER_JSON_NAME}"
-
-    # fetch the swagger spec for the discovery mechanism at group level.
-    if [[ ${ver} == "v1" ]]; then
-      continue
-    fi
-    SUBPATH="apis/"${ver%/*}
-    SWAGGER_JSON_NAME="${ver%/*}.json"
-    curl -w "\n" -fs "${SWAGGER_API_PATH}${SUBPATH}" > "${SWAGGER_ROOT_DIR}/${SWAGGER_JSON_NAME}"
-  done
-
-  # fetch swagger specs for other discovery mechanism.
-  curl -w "\n" -fs "${SWAGGER_API_PATH}" > "${SWAGGER_ROOT_DIR}/resourceListing.json"
-  curl -w "\n" -fs "${SWAGGER_API_PATH}version" > "${SWAGGER_ROOT_DIR}/version.json"
-  curl -w "\n" -fs "${SWAGGER_API_PATH}api" > "${SWAGGER_ROOT_DIR}/api.json"
-  curl -w "\n" -fs "${SWAGGER_API_PATH}apis" > "${SWAGGER_ROOT_DIR}/apis.json"
-  curl -w "\n" -fs "${SWAGGER_API_PATH}logs" > "${SWAGGER_ROOT_DIR}/logs.json"
-}
-
-# Takes a group/version and returns the openapi-spec file name.
-# default behavior: extensions/v1beta1 -> v1beta1.extensions
-# special case for v1: v1 -> v1
-kube::util::gv-to-openapi-name() {
-  local group_version="$1"
-  case "${group_version}" in
-    v1)
-      echo "v1"
-      ;;
-    *)
-      echo "${group_version#*/}.${group_version%/*}"
-      ;;
-  esac
-}
-
-
-# Fetches openapi spec from apiserver.
-# Assumed vars:
-# OPENAPI_API_PATH: Base path for openapi on apiserver. normally APIServer root. i.e., http://localhost:8080/
-# OPENAPI_ROOT_DIR: Root dir where we want to to save the fetched spec.
-# VERSIONS: Array of group versions to include in swagger spec.
-kube::util::fetch-openapi-spec() {
-  for ver in ${VERSIONS}; do
-    if [[ " ${KUBE_NONSERVER_GROUP_VERSIONS} " == *" ${ver} "* ]]; then
-      continue
-    fi
-    # fetch the openapi spec for each group version.
-    if [[ ${ver} == "v1" ]]; then
-      SUBPATH="api"
-    else
-      SUBPATH="apis"
-    fi
-    SUBPATH="${SUBPATH}/${ver}"
-    OPENAPI_JSON_NAME="$(kube::util::gv-to-openapi-name ${ver}).json"
-    curl -w "\n" -fs "${OPENAPI_PATH}${SUBPATH}/swagger.json" > "${OPENAPI_ROOT_DIR}/${OPENAPI_JSON_NAME}"
-
-    # fetch the openapi spec for the discovery mechanism at group level.
-    if [[ ${ver} == "v1" ]]; then
-      continue
-    fi
-    SUBPATH="apis/"${ver%/*}
-    OPENAPI_JSON_NAME="${ver%/*}.json"
-    curl -w "\n" -fs "${OPENAPI_PATH}${SUBPATH}/swagger.json" > "${OPENAPI_ROOT_DIR}/${OPENAPI_JSON_NAME}"
-  done
-
-  # fetch openapi specs for other discovery mechanism.
-  curl -w "\n" -fs "${OPENAPI_PATH}swagger.json" > "${OPENAPI_ROOT_DIR}/root_swagger.json"
-  curl -w "\n" -fs "${OPENAPI_PATH}version/swagger.json" > "${OPENAPI_ROOT_DIR}/version.json"
-  curl -w "\n" -fs "${OPENAPI_PATH}api/swagger.json" > "${OPENAPI_ROOT_DIR}/api.json"
-  curl -w "\n" -fs "${OPENAPI_PATH}apis/swagger.json" > "${OPENAPI_ROOT_DIR}/apis.json"
-  curl -w "\n" -fs "${OPENAPI_PATH}logs/swagger.json" > "${OPENAPI_ROOT_DIR}/logs.json"
-}
-
-
 # Returns the name of the upstream remote repository name for the local git
 # repo, e.g. "upstream" or "origin".
 kube::util::git_upstream_remote_name() {
@@ -449,33 +332,558 @@ kube::util::git_upstream_remote_name() {
     head -n 1 | awk '{print $1}'
 }
 
-# Checks whether there are any files matching pattern $2 changed between the
-# current branch and upstream branch named by $1.
-# Returns 1 (false) if there are no changes, 0 (true) if there are changes
-# detected.
-kube::util::has_changes_against_upstream_branch() {
+# Exits script if working directory is dirty. If it's run interactively in the terminal
+# the user can commit changes in a second terminal. This script will wait.
+kube::util::ensure_clean_working_dir() {
+  while ! git diff HEAD --exit-code &>/dev/null; do
+    echo -e "\nUnexpected dirty working directory:\n"
+    if tty -s; then
+        git status -s
+    else
+        git diff -a # be more verbose in log files without tty
+        exit 1
+    fi | sed 's/^/  /'
+    echo -e "\nCommit your changes in another terminal and then continue here by pressing enter."
+    read -r
+  done 1>&2
+}
+
+# Find the base commit using:
+# $PULL_BASE_SHA if set (from Prow)
+# current ref from the remote upstream branch
+kube::util::base_ref() {
   local -r git_branch=$1
-  local -r pattern=$2
-  local full_branch
+
+  if [[ -n ${PULL_BASE_SHA:-} ]]; then
+    echo "${PULL_BASE_SHA}"
+    return
+  fi
 
   full_branch="$(kube::util::git_upstream_remote_name)/${git_branch}"
-  echo "Checking for '${pattern}' changes against '${full_branch}'"
+
   # make sure the branch is valid, otherwise the check will pass erroneously.
   if ! git describe "${full_branch}" >/dev/null; then
     # abort!
     exit 1
   fi
+
+  echo "${full_branch}"
+}
+
+# Checks whether there are any files matching pattern $2 changed between the
+# current branch and upstream branch named by $1.
+# Returns 1 (false) if there are no changes
+#         0 (true) if there are changes detected.
+kube::util::has_changes() {
+  local -r git_branch=$1
+  local -r pattern=$2
+  local -r not_pattern=${3:-totallyimpossiblepattern}
+
+  local base_ref
+  base_ref=$(kube::util::base_ref "${git_branch}")
+  echo "Checking for '${pattern}' changes against '${base_ref}'"
+
   # notice this uses ... to find the first shared ancestor
-  if git diff --name-only "${full_branch}...HEAD" | grep "${pattern}" > /dev/null; then
+  if git diff --name-only "${base_ref}...HEAD" | grep -v -E "${not_pattern}" | grep "${pattern}" > /dev/null; then
     return 0
   fi
   # also check for pending changes
-  if git status --porcelain | grep "${pattern}" > /dev/null; then
+  if git status --porcelain | grep -v -E "${not_pattern}" | grep "${pattern}" > /dev/null; then
     echo "Detected '${pattern}' uncommitted changes."
     return 0
   fi
   echo "No '${pattern}' changes detected."
   return 1
 }
+
+kube::util::download_file() {
+  local -r url=$1
+  local -r destination_file=$2
+
+  rm "${destination_file}" 2&> /dev/null || true
+
+  for i in $(seq 5)
+  do
+    if ! curl -fsSL --retry 3 --keepalive-time 2 "${url}" -o "${destination_file}"; then
+      echo "Downloading ${url} failed. $((5-i)) retries left."
+      sleep 1
+    else
+      echo "Downloading ${url} succeed"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Test whether openssl is installed.
+# Sets:
+#  OPENSSL_BIN: The path to the openssl binary to use
+function kube::util::test_openssl_installed {
+    if ! openssl version >& /dev/null; then
+      echo "Failed to run openssl. Please ensure openssl is installed"
+      exit 1
+    fi
+
+    OPENSSL_BIN=$(command -v openssl)
+}
+
+# OpenSSL 3.5.0 introduced native ML-DSA support:
+# https://openssl-library.org/news/openssl-3.5-notes/
+function kube::util::test_curl_mldsa_support {
+  local version
+  if ! version=$(curl --version 2>&1); then
+    kube::log::error "Failed to run curl --version: ${version}. ENABLE_MLDSA=true requires curl using OpenSSL 3.5.0 or newer; install a compatible curl build."
+    return 1
+  fi
+  version="${version%%$'\n'*}"
+  # Inactive TLS backends in MultiSSL builds are parenthesized.
+  if [[ "${version}" =~ (^|[[:space:]])OpenSSL/([0-9]+)\.([0-9]+)\.[0-9]+ ]]; then
+    if (( BASH_REMATCH[2] > 3 || (BASH_REMATCH[2] == 3 && BASH_REMATCH[3] >= 5) )); then
+      return 0
+    fi
+  fi
+  kube::log::error "ENABLE_MLDSA=true requires curl using OpenSSL 3.5.0 or newer; detected: ${version}. Upgrade or install curl built with a compatible OpenSSL backend."
+  return 1
+}
+
+# Query the API server for client certificate authentication capabilities
+function kube::util::test_client_certificate_authentication_enabled {
+  local output
+  kube::util::test_openssl_installed
+
+  output=$(echo \
+    | "${OPENSSL_BIN}" s_client -connect "127.0.0.1:${SECURE_API_PORT}" 2> /dev/null \
+    | grep -A3 'Acceptable client certificate CA names')
+
+  if [[ "${output}" != *"CN=127.0.0.1"* ]] && [[ "${output}" != *"CN = 127.0.0.1"* ]]; then
+    echo "API server not configured for client certificate authentication"
+    echo "Output of from acceptable client certificate check: ${output}"
+    exit 1
+  fi
+}
+
+function kube::util::cfssl_keyspec {
+  local key_algo="${KUBE_CERT_KEY_ALGO:-rsa}"
+  local key_size="${KUBE_CERT_KEY_SIZE:-2048}"
+  if [[ "${key_algo}" == mldsa* ]]; then
+    echo -n "{\"algo\":\"${key_algo}\"}"
+  else
+    echo -n "{\"algo\":\"${key_algo}\",\"size\":${key_size}}"
+  fi
+}
+
+# creates a client CA, args are sudo, dest-dir, ca-id, purpose
+# purpose is dropped in after "key encipherment", you usually want
+# '"client auth"'
+# '"server auth"'
+# '"client auth","server auth"'
+function kube::util::create_signing_certkey {
+    local sudo=$1
+    local dest_dir=$2
+    local id=$3
+    local purpose=$4
+    local keyspec
+    keyspec=$(kube::util::cfssl_keyspec)
+    ${sudo} /usr/bin/env bash -e <<EOF
+    rm -f "${dest_dir}/${id}-ca.crt" "${dest_dir}/${id}-ca.key"
+    cd "${dest_dir}"
+    echo '{"CN":"${id}-ca","key":${keyspec}}' | ${CFSSL_BIN} gencert -initca - | ${CFSSLJSON_BIN} -bare ${id}-ca
+    mv "${id}-ca.pem" "${id}-ca.crt"
+    mv "${id}-ca-key.pem" "${id}-ca.key"
+    rm -f "${id}-ca.csr"
+    echo '{"signing":{"default":{"expiry":"43800h","usages":["signing","digital signature",${purpose}]}}}' > "${dest_dir}/${id}-ca-config.json"
+EOF
+}
+
+# signs a client certificate: args are sudo, dest-dir, CA, filename (roughly), username, groups...
+# When KUBE_CERT_KEY_ALGO is set (e.g. mldsa65), uses that algorithm instead of RSA-2048.
+function kube::util::create_client_certkey {
+    local sudo=$1
+    local dest_dir=$2
+    local ca=$3
+    local id=$4
+    local cn=${5:-$4}
+    local groups=""
+    local SEP=""
+    shift 5
+    while [ -n "${1:-}" ]; do
+        groups+="${SEP}{\"O\":\"$1\"}"
+        SEP=","
+        shift 1
+    done
+    local keyspec
+    keyspec=$(kube::util::cfssl_keyspec)
+    ${sudo} /usr/bin/env bash -e <<EOF
+    cd ${dest_dir}
+    echo '{"CN":"${cn}","names":[${groups}],"hosts":[],"key":${keyspec}}' | ${CFSSL_BIN} gencert -ca=${ca}.crt -ca-key=${ca}.key -config=${ca}-config.json - | ${CFSSLJSON_BIN} -bare client-${id}
+    mv "client-${id}-key.pem" "client-${id}.key"
+    mv "client-${id}.pem" "client-${id}.crt"
+    rm -f "client-${id}.csr"
+EOF
+}
+
+# signs a serving certificate: args are sudo, dest-dir, ca, filename (roughly), subject, hosts...
+# When KUBE_CERT_KEY_ALGO is set (e.g. mldsa65), uses that algorithm instead of RSA-2048.
+function kube::util::create_serving_certkey {
+    local sudo=$1
+    local dest_dir=$2
+    local ca=$3
+    local id=$4
+    local cn=${5:-$4}
+    local hosts=""
+    local SEP=""
+    shift 5
+    while [ -n "${1:-}" ]; do
+        hosts+="${SEP}\"$1\""
+        SEP=","
+        shift 1
+    done
+    local keyspec
+    keyspec=$(kube::util::cfssl_keyspec)
+    ${sudo} /usr/bin/env bash -e <<EOF
+    cd ${dest_dir}
+    echo '{"CN":"${cn}","hosts":[${hosts}],"key":${keyspec}}' | ${CFSSL_BIN} gencert -ca=${ca}.crt -ca-key=${ca}.key -config=${ca}-config.json - | ${CFSSLJSON_BIN} -bare serving-${id}
+    mv "serving-${id}-key.pem" "serving-${id}.key"
+    mv "serving-${id}.pem" "serving-${id}.crt"
+    rm -f "serving-${id}.csr"
+EOF
+}
+
+# creates a self-contained kubeconfig: args are sudo, dest-dir, ca file, host, port, client id, token(optional)
+function kube::util::write_client_kubeconfig {
+    local sudo=$1
+    local dest_dir=$2
+    local ca_file=$3
+    local api_host=$4
+    local api_port=$5
+    local client_id=$6
+    local token=${7:-}
+    cat <<EOF | ${sudo} tee "${dest_dir}"/"${client_id}".kubeconfig > /dev/null
+apiVersion: v1
+kind: Config
+clusters:
+  - cluster:
+      certificate-authority: ${ca_file}
+      server: https://${api_host}:${api_port}/
+    name: local-up-cluster
+users:
+  - user:
+      token: ${token}
+      client-certificate: ${dest_dir}/client-${client_id}.crt
+      client-key: ${dest_dir}/client-${client_id}.key
+    name: local-up-cluster
+contexts:
+  - context:
+      cluster: local-up-cluster
+      user: local-up-cluster
+    name: local-up-cluster
+current-context: local-up-cluster
+EOF
+
+    # flatten the kubeconfig files to make them self contained
+    username=$(whoami)
+    ${sudo} /usr/bin/env bash -e <<EOF
+    $(kube::util::find-binary kubectl) --kubeconfig="${dest_dir}/${client_id}.kubeconfig" config view --minify --flatten > "/tmp/${client_id}.kubeconfig"
+    mv -f "/tmp/${client_id}.kubeconfig" "${dest_dir}/${client_id}.kubeconfig"
+    chown ${username} "${dest_dir}/${client_id}.kubeconfig"
+EOF
+}
+
+# list_staging_repos outputs a sorted list of repos in staging/src/k8s.io
+# each entry will just be the $repo portion of staging/src/k8s.io/$repo/...
+# $KUBE_ROOT must be set.
+function kube::util::list_staging_repos() {
+  (
+    cd "${KUBE_ROOT}/staging/src/k8s.io" && \
+    find . -mindepth 1 -maxdepth 1 -type d | cut -c 3- | sort
+  )
+}
+
+
+# Determines if docker can be run, failures may simply require that the user be added to the docker group.
+function kube::util::ensure_docker_daemon_connectivity {
+  DOCKER_OPTS=${DOCKER_OPTS:-""}
+  IFS=" " read -ra docker_opts <<< "${DOCKER_OPTS}"
+  if ! docker "${docker_opts[@]:+"${docker_opts[@]}"}" info > /dev/null 2>&1 ; then
+    cat <<'EOF' >&2
+Can't connect to 'docker' daemon.  please fix and retry.
+
+Possible causes:
+  - Docker Daemon not started
+    - Linux: confirm via your init system
+    - macOS w/ Docker for Mac: Check the menu bar and start the Docker application
+  - DOCKER_HOST hasn't been set or is set incorrectly
+    - Linux: domain socket is used, DOCKER_* should be unset. In Bash run `unset ${!DOCKER_*}`
+    - macOS w/ Docker for Mac: domain socket is used, DOCKER_* should be unset. In Bash run `unset ${!DOCKER_*}`
+  - Other things to check:
+    - Linux: User isn't in 'docker' group.  Add and relogin.
+      - Something like 'sudo usermod -a -G docker ${USER}'
+      - RHEL7 bug and workaround: https://bugzilla.redhat.com/show_bug.cgi?id=1119282#c8
+EOF
+    return 1
+  fi
+}
+
+# Wait for background jobs to finish. Return with
+# an error status if any of the jobs failed.
+kube::util::wait-for-jobs() {
+  local fail=0
+  local job
+  for job in $(jobs -p); do
+    wait "${job}" || fail=$((fail + 1))
+  done
+  return ${fail}
+}
+
+# kube::util::join <delim> <list...>
+# Concatenates the list elements with the delimiter passed as first parameter
+#
+# Ex: kube::util::join , a b c
+#  -> a,b,c
+function kube::util::join {
+  local IFS="$1"
+  shift
+  echo "$*"
+}
+
+# Downloads cfssl/cfssljson into $1 directory if they do not already exist in PATH
+#
+# Assumed vars:
+#   $1 (cfssl directory) (optional)
+#
+# Sets:
+#  CFSSL_BIN: The path of the installed cfssl binary
+#  CFSSLJSON_BIN: The path of the installed cfssljson binary
+#
+# shellcheck disable=SC2120 # optional parameters
+function kube::util::ensure-cfssl {
+  if command -v cfssl &>/dev/null && command -v cfssljson &>/dev/null; then
+    CFSSL_BIN=$(command -v cfssl)
+    CFSSLJSON_BIN=$(command -v cfssljson)
+    return 0
+  fi
+
+  # Create a temp dir for cfssl if no directory was given
+  local cfssldir=${1:-}
+  if [[ -z "${cfssldir}" ]]; then
+    kube::util::ensure-temp-dir
+    cfssldir="${KUBE_TEMP}/cfssl"
+  fi
+
+  mkdir -p "${cfssldir}"
+  pushd "${cfssldir}" > /dev/null || return 1
+
+    echo "Unable to successfully run 'cfssl' from ${PATH}; downloading instead..."
+    local host_os; host_os=$(kube::util::host_os)
+    local host_arch; host_arch=$(kube::util::host_arch)
+    local cfssl_response; cfssl_response=$(curl --retry 10 --write-out "%{response_code}" -fL -o cfssl "https://github.com/cloudflare/cfssl/releases/download/v1.7.1/cfssl_1.7.1_${host_os}_${host_arch}")
+    local cfssljson_response; cfssljson_response=$(curl --retry 10 --write-out "%{response_code}" -fL -o cfssljson "https://github.com/cloudflare/cfssl/releases/download/v1.7.1/cfssljson_1.7.1_${host_os}_${host_arch}")
+
+    if [[ "$cfssl_response" == "404" || "$cfssljson_response" == "404" ]]; then
+      echo "cfssl download unavailable for $host_os/$host_arch and cfssl does not appear to be installed."
+      echo "Please install cfssl and cfssljson and verify they are in \$PATH."
+      echo "Hint: export PATH=\$PATH:\$GOPATH/bin; go install github.com/cloudflare/cfssl/cmd/...@latest"
+      exit 1
+    fi
+
+    chmod +x cfssl || true
+    chmod +x cfssljson || true
+
+    CFSSL_BIN="${cfssldir}/cfssl"
+    CFSSLJSON_BIN="${cfssldir}/cfssljson"
+    if [[ ! -x ${CFSSL_BIN} || ! -x ${CFSSLJSON_BIN} ]]; then
+      echo "Failed to download 'cfssl'. Please install cfssl and cfssljson and verify they are in \$PATH."
+      echo "Hint: export PATH=\$PATH:\$GOPATH/bin; go install github.com/cloudflare/cfssl/cmd/...@latest"
+      exit 1
+    fi
+  popd > /dev/null || return 1
+}
+
+# kube::util::ensure-docker-buildx
+# Check if we have "docker buildx" commands available
+#
+function kube::util::ensure-docker-buildx {
+  # podman returns 0 on `docker buildx version`, docker on `docker buildx`. One of them must succeed.
+  if docker buildx version >/dev/null 2>&1 || docker buildx >/dev/null 2>&1; then
+    return 0
+  else
+    echo "ERROR: docker buildx not available. Docker 19.03 or higher is required with experimental features enabled"
+    exit 1
+  fi
+}
+
+# kube::util::ensure-bash-version
+# Check if we are using a supported bash version
+#
+function kube::util::ensure-bash-version {
+  # shellcheck disable=SC2004
+  if ((${BASH_VERSINFO[0]}<4)) || ( ((${BASH_VERSINFO[0]}==4)) && ((${BASH_VERSINFO[1]}<2)) ); then
+    echo "ERROR: This script requires a minimum bash version of 4.2, but got version of ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]}"
+    if [ "$(uname)" = 'Darwin' ]; then
+      echo "On macOS with homebrew 'brew install bash' is sufficient."
+    fi
+    exit 1
+  fi
+}
+
+# kube::util::ensure-gnu-sed
+# Determines which sed binary is gnu-sed on linux/darwin
+#
+# Sets:
+#  SED: The name of the gnu-sed binary
+#
+function kube::util::ensure-gnu-sed {
+  # NOTE: the echo below is a workaround to ensure sed is executed before the grep.
+  # see: https://github.com/kubernetes/kubernetes/issues/87251
+  sed_help="$(LANG=C sed --help 2>&1 || true)"
+  if echo "${sed_help}" | grep -q "GNU\|BusyBox"; then
+    SED="sed"
+  elif command -v gsed &>/dev/null; then
+    SED="gsed"
+  else
+    kube::log::error "Failed to find GNU sed as sed or gsed. If you are on Mac: brew install gnu-sed." >&2
+    return 1
+  fi
+  kube::util::sourced_variable "${SED}"
+}
+
+# kube::util::ensure-gnu-compatible-date
+# Determines which date binary is gnu-date on linux/darwin
+#
+# Sets:
+#  DATE: The name of the gnu-date binary
+#
+function kube::util::ensure-gnu-compatible-date {
+  # NOTE: the echo below is a workaround to ensure date is executed before the grep.
+  # see: https://github.com/kubernetes/kubernetes/issues/87251
+  date_version="$(LANG=C date --version 2>&1 || true)"
+  if echo "${date_version}" | grep -q "GNU\|BusyBox\|uutils"; then
+    DATE="date"
+  elif command -v gdate &>/dev/null; then
+    DATE="gdate"
+  else
+    kube::log::error "Failed to find GNU-compatible date as date or gdate. If you are on Mac: brew install coreutils." >&2
+    return 1
+  fi
+  kube::util::sourced_variable "${DATE}"
+}
+
+# kube::util::check-file-in-alphabetical-order <file>
+# Check that the file is in alphabetical order
+#
+function kube::util::check-file-in-alphabetical-order {
+  local failure_file="$1"
+  if ! diff -u "${failure_file}" <(LC_ALL=C sort "${failure_file}"); then
+    {
+      echo
+      echo "${failure_file} is not in alphabetical order. Please sort it:"
+      echo
+      echo "  LC_ALL=C sort -o ${failure_file} ${failure_file}"
+      echo
+    } >&2
+    false
+  fi
+}
+
+# kube::util::require-jq
+# Checks whether jq is installed.
+function kube::util::require-jq {
+  if ! command -v jq &>/dev/null; then
+    kube::log::error  "jq not found. Please install."
+    return 1
+  fi
+}
+
+# outputs md5 hash of $1, works on macOS and Linux
+function kube::util::md5() {
+  if which md5 >/dev/null 2>&1; then
+    md5 -q "$1"
+  else
+    md5sum "$1" | awk '{ print $1 }'
+  fi
+}
+
+# kube::util::read-array
+# Reads in stdin and adds it line by line to the array provided. This can be
+# used instead of "mapfile -t", and is bash 3 compatible.  If the named array
+# exists and is an array, it will be overwritten.  Otherwise it will be unset
+# and recreated.
+#
+# Assumed vars:
+#   $1 (name of array to create/modify)
+#
+# Example usage:
+#   kube::util::read-array files < <(ls -1)
+#
+# When in doubt:
+#  $ W=abc         # a string
+#  $ X=(a b c)     # an array
+#  $ declare -A Y  # an associative array
+#  $ unset Z       # not set at all
+#  $ declare -p W X Y Z
+#  declare -- W="abc"
+#  declare -a X=([0]="a" [1]="b" [2]="c")
+#  declare -A Y
+#  bash: line 26: declare: Z: not found
+#  $ kube::util::read-array W < <(echo -ne "1 1\n2 2\n3 3\n")
+#  bash: W is defined but isn't an array
+#  $ kube::util::read-array X < <(echo -ne "1 1\n2 2\n3 3\n")
+#  $ kube::util::read-array Y < <(echo -ne "1 1\n2 2\n3 3\n")
+#  bash: Y is defined but isn't an array
+#  $ kube::util::read-array Z < <(echo -ne "1 1\n2 2\n3 3\n")
+#  $ declare -p W X Y Z
+#  declare -- W="abc"
+#  declare -a X=([0]="1 1" [1]="2 2" [2]="3 3")
+#  declare -A Y
+#  declare -a Z=([0]="1 1" [1]="2 2" [2]="3 3")
+function kube::util::read-array {
+  if [[ -z "$1" ]]; then
+    echo "usage: ${FUNCNAME[0]} <varname>" >&2
+    return 1
+  fi
+  if [[ -n $(declare -p "$1" 2>/dev/null) ]]; then
+    if ! declare -p "$1" 2>/dev/null | grep -q '^declare -a'; then
+      echo "${FUNCNAME[0]}: $1 is defined but isn't an array" >&2
+      return 2
+    fi
+  fi
+  # shellcheck disable=SC2034 # this variable _is_ used
+  local __read_array_i=0
+  while IFS= read -r "$1[__read_array_i++]"; do :; done
+  if ! eval "[[ \${$1[--__read_array_i]} ]]"; then
+    unset "$1[__read_array_i]" # ensures last element isn't empty
+  fi
+}
+
+# kube::util::run-in
+# Changes directory to "$1", runs the rest of the arguments, and restores the initial directory
+# Returns 1 if a directory change fails, the result of running the arguments otherwise
+function kube::util::run-in {
+  pushd "$1" > /dev/null || return 1
+  shift
+  "$@"
+  local result=$?
+  popd > /dev/null || return 1
+  return $result
+}
+
+# Some useful colors.
+if [[ -z "${color_start-}" ]]; then
+  declare -r color_start="\033["
+  declare -r color_red="${color_start}0;31m"
+  declare -r color_yellow="${color_start}0;33m"
+  declare -r color_green="${color_start}0;32m"
+  declare -r color_blue="${color_start}1;34m"
+  declare -r color_cyan="${color_start}1;36m"
+  declare -r color_norm="${color_start}0m"
+
+  kube::util::sourced_variable "${color_start}"
+  kube::util::sourced_variable "${color_red}"
+  kube::util::sourced_variable "${color_yellow}"
+  kube::util::sourced_variable "${color_green}"
+  kube::util::sourced_variable "${color_blue}"
+  kube::util::sourced_variable "${color_cyan}"
+  kube::util::sourced_variable "${color_norm}"
+fi
 
 # ex: ts=2 sw=2 et filetype=sh

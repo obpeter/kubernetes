@@ -1,7 +1,9 @@
-assignees:
-  - brendandburns
-  - deads2k
-  - janetkuo
-  - jlowdermilk
-  - pwittrock
-  - smarterclayton
+# See the OWNERS docs at https://go.k8s.io/owners
+
+approvers:
+  - sig-cli-maintainers
+reviewers:
+  - sig-cli-reviewers
+labels:
+  - area/kubectl
+  - sig/cli

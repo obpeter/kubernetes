@@ -23,19 +23,24 @@ import (
 	"testing"
 	"time"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/testapi"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	"k8s.io/kubernetes/pkg/api/validation"
+	v1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	clientscheme "k8s.io/client-go/kubernetes/scheme"
+	utiltesting "k8s.io/client-go/util/testing"
+	"k8s.io/ktesting"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	k8s_api_v1 "k8s.io/kubernetes/pkg/apis/core/v1"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/types"
-	utiltesting "k8s.io/kubernetes/pkg/util/testing"
 )
 
 func TestURLErrorNotExistNoUpdate(t *testing.T) {
-	ch := make(chan interface{})
-	NewSourceURL("http://localhost:49575/_not_found_", http.Header{}, "localhost", time.Millisecond, ch)
+	logger, _ := ktesting.NewTestContext(t)
+	ch := make(chan sourceUpdate)
+	NewSourceURL(logger, "http://localhost:49575/_not_found_", http.Header{}, "localhost", time.Millisecond, ch)
 	select {
 	case got := <-ch:
 		t.Errorf("Expected no update, Got %#v", got)
@@ -44,60 +49,62 @@ func TestURLErrorNotExistNoUpdate(t *testing.T) {
 }
 
 func TestExtractFromHttpBadness(t *testing.T) {
-	ch := make(chan interface{}, 1)
+	logger, _ := ktesting.NewTestContext(t)
+	ch := make(chan sourceUpdate, 1)
 	c := sourceURL{"http://localhost:49575/_not_found_", http.Header{}, "other", ch, nil, 0, http.DefaultClient}
-	if err := c.extractFromURL(); err == nil {
+	if err := c.extractFromURL(logger); err == nil {
 		t.Errorf("Expected error")
 	}
 	expectEmptyChannel(t, ch)
 }
 
 func TestExtractInvalidPods(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	var testCases = []struct {
 		desc string
-		pod  *api.Pod
+		pod  *v1.Pod
 	}{
 		{
 			desc: "No version",
-			pod:  &api.Pod{TypeMeta: unversioned.TypeMeta{APIVersion: ""}},
+			pod:  &v1.Pod{TypeMeta: metav1.TypeMeta{APIVersion: ""}},
 		},
 		{
 			desc: "Invalid version",
-			pod:  &api.Pod{TypeMeta: unversioned.TypeMeta{APIVersion: "v1betta2"}},
+			pod:  &v1.Pod{TypeMeta: metav1.TypeMeta{APIVersion: "v1betta2"}},
 		},
 		{
 			desc: "Invalid volume name",
-			pod: &api.Pod{
-				TypeMeta: unversioned.TypeMeta{APIVersion: testapi.Default.GroupVersion().String()},
-				Spec: api.PodSpec{
-					Volumes: []api.Volume{{Name: "_INVALID_"}},
+			pod: &v1.Pod{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1"},
+				Spec: v1.PodSpec{
+					Volumes: []v1.Volume{{Name: "_INVALID_"}},
 				},
 			},
 		},
 		{
 			desc: "Duplicate volume names",
-			pod: &api.Pod{
-				TypeMeta: unversioned.TypeMeta{APIVersion: testapi.Default.GroupVersion().String()},
-				Spec: api.PodSpec{
-					Volumes: []api.Volume{{Name: "repeated"}, {Name: "repeated"}},
+			pod: &v1.Pod{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1"},
+				Spec: v1.PodSpec{
+					Volumes: []v1.Volume{{Name: "repeated"}, {Name: "repeated"}},
 				},
 			},
 		},
 		{
 			desc: "Unspecified container name",
-			pod: &api.Pod{
-				TypeMeta: unversioned.TypeMeta{APIVersion: testapi.Default.GroupVersion().String()},
-				Spec: api.PodSpec{
-					Containers: []api.Container{{Name: ""}},
+			pod: &v1.Pod{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1"},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: ""}},
 				},
 			},
 		},
 		{
 			desc: "Invalid container name",
-			pod: &api.Pod{
-				TypeMeta: unversioned.TypeMeta{APIVersion: testapi.Default.GroupVersion().String()},
-				Spec: api.PodSpec{
-					Containers: []api.Container{{Name: "_INVALID_"}},
+			pod: &v1.Pod{
+				TypeMeta: metav1.TypeMeta{APIVersion: "v1"},
+				Spec: v1.PodSpec{
+					Containers: []v1.Container{{Name: "_INVALID_"}},
 				},
 			},
 		},
@@ -108,202 +115,211 @@ func TestExtractInvalidPods(t *testing.T) {
 			t.Fatalf("%s: Some weird json problem: %v", testCase.desc, err)
 		}
 		fakeHandler := utiltesting.FakeHandler{
-			StatusCode:   200,
+			StatusCode:   http.StatusOK,
 			ResponseBody: string(data),
 		}
 		testServer := httptest.NewServer(&fakeHandler)
 		defer testServer.Close()
-		ch := make(chan interface{}, 1)
+		ch := make(chan sourceUpdate, 1)
 		c := sourceURL{testServer.URL, http.Header{}, "localhost", ch, nil, 0, http.DefaultClient}
-		if err := c.extractFromURL(); err == nil {
+		if err := c.extractFromURL(logger); err == nil {
 			t.Errorf("%s: Expected error", testCase.desc)
 		}
 	}
 }
 
 func TestExtractPodsFromHTTP(t *testing.T) {
+	logger, _ := ktesting.NewTestContext(t)
 	nodeName := "different-value"
 
 	grace := int64(30)
+	enableServiceLinks := v1.DefaultEnableServiceLinks
 	var testCases = []struct {
 		desc     string
 		pods     runtime.Object
-		expected kubetypes.PodUpdate
+		expected sourceUpdate
 	}{
 		{
 			desc: "Single pod",
-			pods: &api.Pod{
-				TypeMeta: unversioned.TypeMeta{
+			pods: &v1.Pod{
+				TypeMeta: metav1.TypeMeta{
 					Kind:       "Pod",
 					APIVersion: "",
 				},
-				ObjectMeta: api.ObjectMeta{
+				ObjectMeta: metav1.ObjectMeta{
 					Name:      "foo",
 					UID:       "111",
 					Namespace: "mynamespace",
 				},
-				Spec: api.PodSpec{
+				Spec: v1.PodSpec{
 					NodeName:        string(nodeName),
-					Containers:      []api.Container{{Name: "1", Image: "foo", ImagePullPolicy: api.PullAlways}},
-					SecurityContext: &api.PodSecurityContext{},
+					Containers:      []v1.Container{{Name: "1", Image: "foo", ImagePullPolicy: v1.PullAlways, TerminationMessagePolicy: v1.TerminationMessageReadFile}},
+					SecurityContext: &v1.PodSecurityContext{},
+					SchedulerName:   v1.DefaultSchedulerName,
 				},
-				Status: api.PodStatus{
-					Phase: api.PodPending,
+				Status: v1.PodStatus{
+					Phase: v1.PodPending,
 				},
 			},
-			expected: CreatePodUpdate(kubetypes.SET,
-				kubetypes.HTTPSource,
-				&api.Pod{
-					ObjectMeta: api.ObjectMeta{
+			expected: createSourceUpdate(
+				&v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
 						UID:         "111",
 						Name:        "foo" + "-" + nodeName,
 						Namespace:   "mynamespace",
 						Annotations: map[string]string{kubetypes.ConfigHashAnnotationKey: "111"},
-						SelfLink:    getSelfLink("foo-"+nodeName, "mynamespace"),
 					},
-					Spec: api.PodSpec{
+					Spec: v1.PodSpec{
 						NodeName:                      nodeName,
-						RestartPolicy:                 api.RestartPolicyAlways,
-						DNSPolicy:                     api.DNSClusterFirst,
-						SecurityContext:               &api.PodSecurityContext{},
+						RestartPolicy:                 v1.RestartPolicyAlways,
+						DNSPolicy:                     v1.DNSClusterFirst,
+						SecurityContext:               &v1.PodSecurityContext{},
 						TerminationGracePeriodSeconds: &grace,
+						SchedulerName:                 v1.DefaultSchedulerName,
+						EnableServiceLinks:            &enableServiceLinks,
 
-						Containers: []api.Container{{
-							Name:  "1",
-							Image: "foo",
-							TerminationMessagePath: "/dev/termination-log",
-							ImagePullPolicy:        "Always",
+						Containers: []v1.Container{{
+							Name:                     "1",
+							Image:                    "foo",
+							TerminationMessagePath:   "/dev/termination-log",
+							ImagePullPolicy:          "Always",
+							TerminationMessagePolicy: v1.TerminationMessageReadFile,
 						}},
 					},
-					Status: api.PodStatus{
-						Phase: api.PodPending,
+					Status: v1.PodStatus{
+						Phase: v1.PodPending,
 					},
 				}),
 		},
 		{
 			desc: "Multiple pods",
-			pods: &api.PodList{
-				TypeMeta: unversioned.TypeMeta{
+			pods: &v1.PodList{
+				TypeMeta: metav1.TypeMeta{
 					Kind:       "PodList",
 					APIVersion: "",
 				},
-				Items: []api.Pod{
+				Items: []v1.Pod{
 					{
-						ObjectMeta: api.ObjectMeta{
+						ObjectMeta: metav1.ObjectMeta{
 							Name: "foo",
 							UID:  "111",
 						},
-						Spec: api.PodSpec{
+						Spec: v1.PodSpec{
 							NodeName:        nodeName,
-							Containers:      []api.Container{{Name: "1", Image: "foo", ImagePullPolicy: api.PullAlways}},
-							SecurityContext: &api.PodSecurityContext{},
+							Containers:      []v1.Container{{Name: "1", Image: "foo", ImagePullPolicy: v1.PullAlways, TerminationMessagePolicy: v1.TerminationMessageReadFile}},
+							SecurityContext: &v1.PodSecurityContext{},
+							SchedulerName:   v1.DefaultSchedulerName,
 						},
-						Status: api.PodStatus{
-							Phase: api.PodPending,
+						Status: v1.PodStatus{
+							Phase: v1.PodPending,
 						},
 					},
 					{
-						ObjectMeta: api.ObjectMeta{
+						ObjectMeta: metav1.ObjectMeta{
 							Name: "bar",
 							UID:  "222",
 						},
-						Spec: api.PodSpec{
+						Spec: v1.PodSpec{
 							NodeName:        nodeName,
-							Containers:      []api.Container{{Name: "2", Image: "bar:bartag", ImagePullPolicy: ""}},
-							SecurityContext: &api.PodSecurityContext{},
+							Containers:      []v1.Container{{Name: "2", Image: "bar:bartag", ImagePullPolicy: "", TerminationMessagePolicy: v1.TerminationMessageReadFile}},
+							SecurityContext: &v1.PodSecurityContext{},
+							SchedulerName:   v1.DefaultSchedulerName,
 						},
-						Status: api.PodStatus{
-							Phase: api.PodPending,
+						Status: v1.PodStatus{
+							Phase: v1.PodPending,
 						},
 					},
 				},
 			},
-			expected: CreatePodUpdate(kubetypes.SET,
-				kubetypes.HTTPSource,
-				&api.Pod{
-					ObjectMeta: api.ObjectMeta{
+			expected: createSourceUpdate(
+				&v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
 						UID:         "111",
 						Name:        "foo" + "-" + nodeName,
 						Namespace:   "default",
 						Annotations: map[string]string{kubetypes.ConfigHashAnnotationKey: "111"},
-						SelfLink:    getSelfLink("foo-"+nodeName, kubetypes.NamespaceDefault),
 					},
-					Spec: api.PodSpec{
+					Spec: v1.PodSpec{
 						NodeName:                      nodeName,
-						RestartPolicy:                 api.RestartPolicyAlways,
-						DNSPolicy:                     api.DNSClusterFirst,
+						RestartPolicy:                 v1.RestartPolicyAlways,
+						DNSPolicy:                     v1.DNSClusterFirst,
 						TerminationGracePeriodSeconds: &grace,
-						SecurityContext:               &api.PodSecurityContext{},
+						SecurityContext:               &v1.PodSecurityContext{},
+						SchedulerName:                 v1.DefaultSchedulerName,
+						EnableServiceLinks:            &enableServiceLinks,
 
-						Containers: []api.Container{{
-							Name:  "1",
-							Image: "foo",
-							TerminationMessagePath: "/dev/termination-log",
-							ImagePullPolicy:        "Always",
+						Containers: []v1.Container{{
+							Name:                     "1",
+							Image:                    "foo",
+							TerminationMessagePath:   "/dev/termination-log",
+							ImagePullPolicy:          "Always",
+							TerminationMessagePolicy: v1.TerminationMessageReadFile,
 						}},
 					},
-					Status: api.PodStatus{
-						Phase: api.PodPending,
+					Status: v1.PodStatus{
+						Phase: v1.PodPending,
 					},
 				},
-				&api.Pod{
-					ObjectMeta: api.ObjectMeta{
+				&v1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
 						UID:         "222",
 						Name:        "bar" + "-" + nodeName,
 						Namespace:   "default",
 						Annotations: map[string]string{kubetypes.ConfigHashAnnotationKey: "222"},
-						SelfLink:    getSelfLink("bar-"+nodeName, kubetypes.NamespaceDefault),
 					},
-					Spec: api.PodSpec{
+					Spec: v1.PodSpec{
 						NodeName:                      nodeName,
-						RestartPolicy:                 api.RestartPolicyAlways,
-						DNSPolicy:                     api.DNSClusterFirst,
+						RestartPolicy:                 v1.RestartPolicyAlways,
+						DNSPolicy:                     v1.DNSClusterFirst,
 						TerminationGracePeriodSeconds: &grace,
-						SecurityContext:               &api.PodSecurityContext{},
+						SecurityContext:               &v1.PodSecurityContext{},
+						SchedulerName:                 v1.DefaultSchedulerName,
+						EnableServiceLinks:            &enableServiceLinks,
 
-						Containers: []api.Container{{
-							Name:  "2",
-							Image: "bar:bartag",
-							TerminationMessagePath: "/dev/termination-log",
-							ImagePullPolicy:        "IfNotPresent",
+						Containers: []v1.Container{{
+							Name:                     "2",
+							Image:                    "bar:bartag",
+							TerminationMessagePath:   "/dev/termination-log",
+							ImagePullPolicy:          "IfNotPresent",
+							TerminationMessagePolicy: v1.TerminationMessageReadFile,
 						}},
 					},
-					Status: api.PodStatus{
-						Phase: api.PodPending,
+					Status: v1.PodStatus{
+						Phase: v1.PodPending,
 					},
 				}),
 		},
 	}
 
 	for _, testCase := range testCases {
-		var versionedPods runtime.Object
-		err := testapi.Default.Converter().Convert(&testCase.pods, &versionedPods, nil)
-		if err != nil {
-			t.Fatalf("%s: error in versioning the pods: %s", testCase.desc, err)
-		}
-		data, err := runtime.Encode(testapi.Default.Codec(), versionedPods)
+		data, err := runtime.Encode(clientscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), testCase.pods)
 		if err != nil {
 			t.Fatalf("%s: error in encoding the pod: %v", testCase.desc, err)
 		}
 		fakeHandler := utiltesting.FakeHandler{
-			StatusCode:   200,
+			StatusCode:   http.StatusOK,
 			ResponseBody: string(data),
 		}
 		testServer := httptest.NewServer(&fakeHandler)
 		defer testServer.Close()
-		ch := make(chan interface{}, 1)
+		ch := make(chan sourceUpdate, 1)
 		c := sourceURL{testServer.URL, http.Header{}, types.NodeName(nodeName), ch, nil, 0, http.DefaultClient}
-		if err := c.extractFromURL(); err != nil {
+		if err := c.extractFromURL(logger); err != nil {
 			t.Errorf("%s: Unexpected error: %v", testCase.desc, err)
 			continue
 		}
-		update := (<-ch).(kubetypes.PodUpdate)
+		update := <-ch
 
-		if !api.Semantic.DeepEqual(testCase.expected, update) {
+		if !apiequality.Semantic.DeepEqual(testCase.expected, update) {
 			t.Errorf("%s: Expected: %#v, Got: %#v", testCase.desc, testCase.expected, update)
 		}
 		for _, pod := range update.Pods {
-			if errs := validation.ValidatePod(pod); len(errs) != 0 {
+			// TODO: remove the conversion when validation is performed on versioned objects.
+			internalPod := &api.Pod{}
+			if err := k8s_api_v1.Convert_v1_Pod_To_core_Pod(pod, internalPod, nil); err != nil {
+				t.Fatalf("%s: Cannot convert pod %#v, %#v", testCase.desc, pod, err)
+			}
+			if errs := validation.ValidatePodCreate(internalPod, validation.PodValidationOptions{}); len(errs) != 0 {
 				t.Errorf("%s: Expected no validation errors on %#v, Got %v", testCase.desc, pod, errs.ToAggregate())
 			}
 		}
@@ -311,19 +327,19 @@ func TestExtractPodsFromHTTP(t *testing.T) {
 }
 
 func TestURLWithHeader(t *testing.T) {
-	pod := &api.Pod{
-		TypeMeta: unversioned.TypeMeta{
-			APIVersion: testapi.Default.GroupVersion().String(),
+	pod := &v1.Pod{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
 			Kind:       "Pod",
 		},
-		ObjectMeta: api.ObjectMeta{
+		ObjectMeta: metav1.ObjectMeta{
 			Name:      "foo",
 			UID:       "111",
 			Namespace: "mynamespace",
 		},
-		Spec: api.PodSpec{
+		Spec: v1.PodSpec{
 			NodeName:   "localhost",
-			Containers: []api.Container{{Name: "1", Image: "foo", ImagePullPolicy: api.PullAlways}},
+			Containers: []v1.Container{{Name: "1", Image: "foo", ImagePullPolicy: v1.PullAlways}},
 		},
 	}
 	data, err := json.Marshal(pod)
@@ -331,19 +347,21 @@ func TestURLWithHeader(t *testing.T) {
 		t.Fatalf("Unexpected json marshalling error: %v", err)
 	}
 	fakeHandler := utiltesting.FakeHandler{
-		StatusCode:   200,
+		StatusCode:   http.StatusOK,
 		ResponseBody: string(data),
 	}
 	testServer := httptest.NewServer(&fakeHandler)
 	defer testServer.Close()
-	ch := make(chan interface{}, 1)
+
+	logger, _ := ktesting.NewTestContext(t)
+	ch := make(chan sourceUpdate, 1)
 	header := make(http.Header)
 	header.Set("Metadata-Flavor", "Google")
 	c := sourceURL{testServer.URL, header, "localhost", ch, nil, 0, http.DefaultClient}
-	if err := c.extractFromURL(); err != nil {
+	if err := c.extractFromURL(logger); err != nil {
 		t.Fatalf("Unexpected error extracting from URL: %v", err)
 	}
-	update := (<-ch).(kubetypes.PodUpdate)
+	update := <-ch
 
 	headerVal := fakeHandler.RequestReceived.Header["Metadata-Flavor"]
 	if len(headerVal) != 1 || headerVal[0] != "Google" {

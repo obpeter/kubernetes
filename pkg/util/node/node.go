@@ -17,89 +17,91 @@ limitations under the License.
 package node
 
 import (
-	"encoding/json"
 	"fmt"
 	"net"
-	"os"
-	"strings"
-	"time"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/unversioned"
-	clientset "k8s.io/kubernetes/pkg/client/clientset_generated/internalclientset"
-	"k8s.io/kubernetes/pkg/types"
+	v1 "k8s.io/api/core/v1"
+	netutils "k8s.io/utils/net"
 )
 
-func GetHostname(hostnameOverride string) string {
-	var hostname string = hostnameOverride
-	if hostname == "" {
-		nodename, err := os.Hostname()
-		if err != nil {
-			glog.Fatalf("Couldn't determine hostname: %v", err)
+const (
+	// NodeUnreachablePodReason is the reason on a pod when its state cannot be confirmed as kubelet is unresponsive
+	// on the node it is (was) running.
+	NodeUnreachablePodReason = "NodeLost"
+	// NodeUnreachablePodMessage is the message on a pod when its state cannot be confirmed as kubelet is unresponsive
+	// on the node it is (was) running.
+	NodeUnreachablePodMessage = "Node %v which was running pod %v is unresponsive"
+)
+
+// NoMatchError is a typed implementation of the error interface. It indicates a failure to get a matching Node.
+type NoMatchError struct {
+	addresses []v1.NodeAddress
+}
+
+// Error is the implementation of the conventional interface for
+// representing an error condition, with the nil value representing no error.
+func (e *NoMatchError) Error() string {
+	return fmt.Sprintf("no preferred addresses found; known addresses: %v", e.addresses)
+}
+
+// GetPreferredNodeAddress returns the address of the provided node, using the provided preference order.
+// If none of the preferred address types are found, an error is returned.
+func GetPreferredNodeAddress(node *v1.Node, preferredAddressTypes []v1.NodeAddressType) (string, error) {
+	for _, addressType := range preferredAddressTypes {
+		for _, address := range node.Status.Addresses {
+			if address.Type == addressType {
+				return address.Address, nil
+			}
 		}
-		hostname = nodename
 	}
-	return strings.ToLower(strings.TrimSpace(hostname))
+	return "", &NoMatchError{addresses: node.Status.Addresses}
 }
 
-// GetNodeHostIP returns the provided node's IP, based on the priority:
-// 1. NodeInternalIP
-// 2. NodeExternalIP
-// 3. NodeLegacyHostIP
-func GetNodeHostIP(node *api.Node) (net.IP, error) {
-	addresses := node.Status.Addresses
-	addressMap := make(map[api.NodeAddressType][]api.NodeAddress)
-	for i := range addresses {
-		addressMap[addresses[i].Type] = append(addressMap[addresses[i].Type], addresses[i])
-	}
-	if addresses, ok := addressMap[api.NodeInternalIP]; ok {
-		return net.ParseIP(addresses[0].Address), nil
-	}
-	if addresses, ok := addressMap[api.NodeExternalIP]; ok {
-		return net.ParseIP(addresses[0].Address), nil
-	}
-	if addresses, ok := addressMap[api.NodeLegacyHostIP]; ok {
-		return net.ParseIP(addresses[0].Address), nil
-	}
-	return nil, fmt.Errorf("host IP unknown; known addresses: %v", addresses)
-}
-
-// Helper function that builds a string identifier that is unique per failure-zone
-// Returns empty-string for no zone
-func GetZoneKey(node *api.Node) string {
-	labels := node.Labels
-	if labels == nil {
-		return ""
-	}
-
-	region, _ := labels[unversioned.LabelZoneRegion]
-	failureDomain, _ := labels[unversioned.LabelZoneFailureDomain]
-
-	if region == "" && failureDomain == "" {
-		return ""
-	}
-
-	// We include the null character just in case region or failureDomain has a colon
-	// (We do assume there's no null characters in a region or failureDomain)
-	// As a nice side-benefit, the null character is not printed by fmt.Print or glog
-	return region + ":\x00:" + failureDomain
-}
-
-// SetNodeCondition updates specific node condition with patch operation.
-func SetNodeCondition(c clientset.Interface, node types.NodeName, condition api.NodeCondition) error {
-	generatePatch := func(condition api.NodeCondition) ([]byte, error) {
-		raw, err := json.Marshal(&[]api.NodeCondition{condition})
-		if err != nil {
-			return nil, err
+// GetNodeHostIPs returns the provided node's IP(s); either a single "primary IP" for the
+// node in a single-stack cluster, or a dual-stack pair of IPs in a dual-stack cluster
+// (for nodes that actually have dual-stack IPs). Among other things, the IPs returned
+// from this function are used as the `.status.PodIPs` values for host-network pods on the
+// node, and the first IP is used as the `.status.HostIP` for all pods on the node.
+func GetNodeHostIPs(node *v1.Node) ([]net.IP, error) {
+	// Re-sort the addresses with InternalIPs first and then ExternalIPs
+	allIPs := make([]net.IP, 0, len(node.Status.Addresses))
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == v1.NodeInternalIP {
+			ip := netutils.ParseIPSloppy(addr.Address)
+			if ip != nil {
+				allIPs = append(allIPs, ip)
+			}
 		}
-		return []byte(fmt.Sprintf(`{"status":{"conditions":%s}}`, raw)), nil
 	}
-	condition.LastHeartbeatTime = unversioned.NewTime(time.Now())
-	patch, err := generatePatch(condition)
-	if err != nil {
-		return nil
+	for _, addr := range node.Status.Addresses {
+		if addr.Type == v1.NodeExternalIP {
+			ip := netutils.ParseIPSloppy(addr.Address)
+			if ip != nil {
+				allIPs = append(allIPs, ip)
+			}
+		}
 	}
-	_, err = c.Core().Nodes().PatchStatus(string(node), patch)
-	return err
+	if len(allIPs) == 0 {
+		return nil, fmt.Errorf("host IP unknown; known addresses: %v", node.Status.Addresses)
+	}
+
+	nodeIPs := []net.IP{allIPs[0]}
+	for _, ip := range allIPs {
+		if netutils.IsIPv6(ip) != netutils.IsIPv6(nodeIPs[0]) {
+			nodeIPs = append(nodeIPs, ip)
+			break
+		}
+	}
+
+	return nodeIPs, nil
+}
+
+// IsNodeReady returns true if a node is ready; false otherwise.
+func IsNodeReady(node *v1.Node) bool {
+	for _, c := range node.Status.Conditions {
+		if c.Type == v1.NodeReady {
+			return c.Status == v1.ConditionTrue
+		}
+	}
+	return false
 }

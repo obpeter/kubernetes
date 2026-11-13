@@ -17,96 +17,90 @@ limitations under the License.
 package config
 
 import (
-	"fmt"
+	"context"
 	"reflect"
 	"sync"
+	"time"
 
-	"github.com/golang/glog"
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/validation"
-	"k8s.io/kubernetes/pkg/client/record"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/klog/v2"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
 	"k8s.io/kubernetes/pkg/kubelet/events"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	"k8s.io/kubernetes/pkg/kubelet/util/format"
-	"k8s.io/kubernetes/pkg/util/config"
-	"k8s.io/kubernetes/pkg/util/sets"
-	"k8s.io/kubernetes/pkg/util/validation/field"
 )
 
-// PodConfigNotificationMode describes how changes are sent to the update channel.
-type PodConfigNotificationMode int
-
-const (
-	// PodConfigNotificationUnknown is the default value for
-	// PodConfigNotificationMode when uninitialized.
-	PodConfigNotificationUnknown = iota
-	// PodConfigNotificationSnapshot delivers the full configuration as a SET whenever
-	// any change occurs.
-	PodConfigNotificationSnapshot
-	// PodConfigNotificationSnapshotAndUpdates delivers an UPDATE and DELETE message whenever pods are
-	// changed, and a SET message if there are any additions or removals.
-	PodConfigNotificationSnapshotAndUpdates
-	// PodConfigNotificationIncremental delivers ADD, UPDATE, DELETE, REMOVE, RECONCILE to the update channel.
-	PodConfigNotificationIncremental
-)
+type podStartupSLIObserver interface {
+	ObservedPodOnWatch(logger klog.Logger, pod *v1.Pod, when time.Time)
+}
 
 // PodConfig is a configuration mux that merges many sources of pod configuration into a single
 // consistent structure, and then delivers incremental change notifications to listeners
 // in order.
 type PodConfig struct {
 	pods *podStorage
-	mux  *config.Mux
+	mux  *mux
 
 	// the channel of denormalized changes passed to listeners
 	updates chan kubetypes.PodUpdate
 
 	// contains the list of all configured sources
 	sourcesLock sync.Mutex
-	sources     sets.String
+	sources     sets.Set[string]
+}
+
+type sourceUpdate struct {
+	Pods []*v1.Pod
 }
 
 // NewPodConfig creates an object that can merge many configuration sources into a stream
 // of normalized updates to a pod configuration.
-func NewPodConfig(mode PodConfigNotificationMode, recorder record.EventRecorder) *PodConfig {
+func NewPodConfig(recorder record.EventRecorderLogger, startupSLIObserver podStartupSLIObserver) *PodConfig {
 	updates := make(chan kubetypes.PodUpdate, 50)
-	storage := newPodStorage(updates, mode, recorder)
+	storage := newPodStorage(updates, recorder, startupSLIObserver)
 	podConfig := &PodConfig{
 		pods:    storage,
-		mux:     config.NewMux(storage),
+		mux:     newMux(storage),
 		updates: updates,
-		sources: sets.String{},
+		sources: sets.Set[string]{},
 	}
 	return podConfig
 }
 
 // Channel creates or returns a config source channel.  The channel
 // only accepts PodUpdates
-func (c *PodConfig) Channel(source string) chan<- interface{} {
+func (c *PodConfig) Channel(ctx context.Context, source string) chan<- sourceUpdate {
 	c.sourcesLock.Lock()
 	defer c.sourcesLock.Unlock()
 	c.sources.Insert(source)
-	return c.mux.Channel(source)
+	return c.mux.ChannelWithContext(ctx, source)
+}
+
+// SourcesReadyFn returns a readiness callback using the provided logger for SeenAllSources.
+func (c *PodConfig) SourcesReadyFn(logger klog.Logger) SourcesReadyFn {
+	return func(seenSources sets.Set[string]) bool {
+		return c.SeenAllSources(logger, seenSources)
+	}
 }
 
 // SeenAllSources returns true if seenSources contains all sources in the
 // config, and also this config has received a SET message from each source.
-func (c *PodConfig) SeenAllSources(seenSources sets.String) bool {
+func (c *PodConfig) SeenAllSources(logger klog.Logger, seenSources sets.Set[string]) bool {
 	if c.pods == nil {
 		return false
 	}
-	glog.V(6).Infof("Looking for %v, have seen %v", c.sources.List(), seenSources)
-	return seenSources.HasAll(c.sources.List()...) && c.pods.seenSources(c.sources.List()...)
+	c.sourcesLock.Lock()
+	defer c.sourcesLock.Unlock()
+	logger.V(5).Info("Looking for sources, have seen", "sources", sets.List(c.sources), "seenSources", seenSources)
+	return seenSources.HasAll(sets.List(c.sources)...) && c.pods.seenSources(sets.List(c.sources)...)
 }
 
 // Updates returns a channel of updates to the configuration, properly denormalized.
 func (c *PodConfig) Updates() <-chan kubetypes.PodUpdate {
 	return c.updates
-}
-
-// Sync requests the full configuration be delivered to the update channel.
-func (c *PodConfig) Sync() {
-	c.pods.Sync()
 }
 
 // podStorage manages the current pod state at any point in time and ensures updates
@@ -115,9 +109,8 @@ func (c *PodConfig) Sync() {
 // available, then this object should be considered authoritative.
 type podStorage struct {
 	podLock sync.RWMutex
-	// map of source name to pod name to pod reference
-	pods map[string]map[string]*api.Pod
-	mode PodConfigNotificationMode
+	// map of source name to pod uid to pod reference
+	pods map[string]map[types.UID]*v1.Pod
 
 	// ensures that updates are delivered in strict order
 	// on the updates channel
@@ -126,116 +119,98 @@ type podStorage struct {
 
 	// contains the set of all sources that have sent at least one SET
 	sourcesSeenLock sync.RWMutex
-	sourcesSeen     sets.String
+	sourcesSeen     sets.Set[string]
 
 	// the EventRecorder to use
-	recorder record.EventRecorder
+	recorder record.EventRecorderLogger
+
+	startupSLIObserver podStartupSLIObserver
 }
 
 // TODO: PodConfigNotificationMode could be handled by a listener to the updates channel
 // in the future, especially with multiple listeners.
 // TODO: allow initialization of the current state of the store with snapshotted version.
-func newPodStorage(updates chan<- kubetypes.PodUpdate, mode PodConfigNotificationMode, recorder record.EventRecorder) *podStorage {
+func newPodStorage(updates chan<- kubetypes.PodUpdate, recorder record.EventRecorderLogger, startupSLIObserver podStartupSLIObserver) *podStorage {
 	return &podStorage{
-		pods:        make(map[string]map[string]*api.Pod),
-		mode:        mode,
-		updates:     updates,
-		sourcesSeen: sets.String{},
-		recorder:    recorder,
+		pods:               make(map[string]map[types.UID]*v1.Pod),
+		updates:            updates,
+		sourcesSeen:        sets.Set[string]{},
+		recorder:           recorder,
+		startupSLIObserver: startupSLIObserver,
 	}
 }
 
-// Merge normalizes a set of incoming changes from different sources into a map of all Pods
-// and ensures that redundant changes are filtered out, and then pushes zero or more minimal
+// Merge normalizes a set of incoming updates from different sources into a map of all Pods
+// and ensures that redundant updates are filtered out, and then pushes zero or more minimal
 // updates onto the update channel.  Ensures that updates are delivered in order.
-func (s *podStorage) Merge(source string, change interface{}) error {
+func (s *podStorage) Merge(ctx context.Context, source string, update sourceUpdate) error {
 	s.updateLock.Lock()
 	defer s.updateLock.Unlock()
 
 	seenBefore := s.sourcesSeen.Has(source)
-	adds, updates, deletes, removes, reconciles := s.merge(source, change)
+	adds, updates, deletes, removes, reconciles := s.merge(ctx, source, update)
 	firstSet := !seenBefore && s.sourcesSeen.Has(source)
 
 	// deliver update notifications
-	switch s.mode {
-	case PodConfigNotificationIncremental:
-		if len(removes.Pods) > 0 {
-			s.updates <- *removes
-		}
-		if len(adds.Pods) > 0 {
-			s.updates <- *adds
-		}
-		if len(updates.Pods) > 0 {
-			s.updates <- *updates
-		}
-		if len(deletes.Pods) > 0 {
-			s.updates <- *deletes
-		}
-		if firstSet && len(adds.Pods) == 0 && len(updates.Pods) == 0 && len(deletes.Pods) == 0 {
-			// Send an empty update when first seeing the source and there are
-			// no ADD or UPDATE or DELETE pods from the source. This signals kubelet that
-			// the source is ready.
-			s.updates <- *adds
-		}
-		// Only add reconcile support here, because kubelet doesn't support Snapshot update now.
-		if len(reconciles.Pods) > 0 {
-			s.updates <- *reconciles
-		}
-
-	case PodConfigNotificationSnapshotAndUpdates:
-		if len(removes.Pods) > 0 || len(adds.Pods) > 0 || firstSet {
-			s.updates <- kubetypes.PodUpdate{Pods: s.MergedState().([]*api.Pod), Op: kubetypes.SET, Source: source}
-		}
-		if len(updates.Pods) > 0 {
-			s.updates <- *updates
-		}
-		if len(deletes.Pods) > 0 {
-			s.updates <- *deletes
-		}
-
-	case PodConfigNotificationSnapshot:
-		if len(updates.Pods) > 0 || len(deletes.Pods) > 0 || len(adds.Pods) > 0 || len(removes.Pods) > 0 || firstSet {
-			s.updates <- kubetypes.PodUpdate{Pods: s.MergedState().([]*api.Pod), Op: kubetypes.SET, Source: source}
-		}
-
-	case PodConfigNotificationUnknown:
-		fallthrough
-	default:
-		panic(fmt.Sprintf("unsupported PodConfigNotificationMode: %#v", s.mode))
+	if len(removes.Pods) > 0 {
+		s.updates <- *removes
+	}
+	if len(adds.Pods) > 0 {
+		s.updates <- *adds
+	}
+	if len(updates.Pods) > 0 {
+		s.updates <- *updates
+	}
+	if len(deletes.Pods) > 0 {
+		s.updates <- *deletes
+	}
+	if firstSet && len(adds.Pods) == 0 && len(updates.Pods) == 0 && len(deletes.Pods) == 0 {
+		// Send an empty update when first seeing the source and there are
+		// no ADD or UPDATE or DELETE pods from the source. This signals kubelet that
+		// the source is ready.
+		s.updates <- *adds
+	}
+	// Only add reconcile support here, because kubelet doesn't support Snapshot update now.
+	if len(reconciles.Pods) > 0 {
+		s.updates <- *reconciles
 	}
 
 	return nil
 }
 
-func (s *podStorage) merge(source string, change interface{}) (adds, updates, deletes, removes, reconciles *kubetypes.PodUpdate) {
+func (s *podStorage) merge(ctx context.Context, source string, update sourceUpdate) (adds, updates, deletes, removes, reconciles *kubetypes.PodUpdate) {
 	s.podLock.Lock()
 	defer s.podLock.Unlock()
+	logger := klog.FromContext(ctx)
 
-	addPods := []*api.Pod{}
-	updatePods := []*api.Pod{}
-	deletePods := []*api.Pod{}
-	removePods := []*api.Pod{}
-	reconcilePods := []*api.Pod{}
+	addPods := []*v1.Pod{}
+	updatePods := []*v1.Pod{}
+	deletePods := []*v1.Pod{}
+	removePods := []*v1.Pod{}
+	reconcilePods := []*v1.Pod{}
 
 	pods := s.pods[source]
 	if pods == nil {
-		pods = make(map[string]*api.Pod)
+		pods = make(map[types.UID]*v1.Pod)
 	}
 
 	// updatePodFunc is the local function which updates the pod cache *oldPods* with new pods *newPods*.
 	// After updated, new pod will be stored in the pod cache *pods*.
 	// Notice that *pods* and *oldPods* could be the same cache.
-	updatePodsFunc := func(newPods []*api.Pod, oldPods, pods map[string]*api.Pod) {
-		filtered := filterInvalidPods(newPods, source, s.recorder)
+	updatePodsFunc := func(newPods []*v1.Pod, oldPods, pods map[types.UID]*v1.Pod) {
+		filtered := filterInvalidPods(logger, newPods, source, s.recorder)
 		for _, ref := range filtered {
-			name := kubecontainer.GetPodFullName(ref)
 			// Annotate the pod with the source before any comparison.
 			if ref.Annotations == nil {
 				ref.Annotations = make(map[string]string)
 			}
 			ref.Annotations[kubetypes.ConfigSourceAnnotationKey] = source
-			if existing, found := oldPods[name]; found {
-				pods[name] = existing
+			// ignore static pods
+			if !kubetypes.IsStaticPod(ref) {
+				s.startupSLIObserver.ObservedPodOnWatch(logger, ref, time.Now())
+			}
+			if existing, found := oldPods[ref.UID]; found {
+				pods[ref.UID] = existing
 				needUpdate, needReconcile, needGracefulDelete := checkAndUpdatePod(existing, ref)
 				if needUpdate {
 					updatePods = append(updatePods, existing)
@@ -246,54 +221,23 @@ func (s *podStorage) merge(source string, change interface{}) (adds, updates, de
 				}
 				continue
 			}
-			recordFirstSeenTime(ref)
-			pods[name] = ref
+			recordFirstSeenTime(logger, ref)
+			pods[ref.UID] = ref
 			addPods = append(addPods, ref)
 		}
 	}
 
-	update := change.(kubetypes.PodUpdate)
-	switch update.Op {
-	case kubetypes.ADD, kubetypes.UPDATE, kubetypes.DELETE:
-		if update.Op == kubetypes.ADD {
-			glog.V(4).Infof("Adding new pods from source %s : %v", source, update.Pods)
-		} else if update.Op == kubetypes.DELETE {
-			glog.V(4).Infof("Graceful deleting pods from source %s : %v", source, update.Pods)
-		} else {
-			glog.V(4).Infof("Updating pods from source %s : %v", source, update.Pods)
+	logger.V(4).Info("Setting pods for source", "source", source)
+	s.markSourceSet(source)
+	// Clear the old map entries by just creating a new map
+	oldPods := pods
+	pods = make(map[types.UID]*v1.Pod)
+	updatePodsFunc(update.Pods, oldPods, pods)
+	for uid, existing := range oldPods {
+		if _, found := pods[uid]; !found {
+			// this is a delete
+			removePods = append(removePods, existing)
 		}
-		updatePodsFunc(update.Pods, pods, pods)
-
-	case kubetypes.REMOVE:
-		glog.V(4).Infof("Removing pods from source %s : %v", source, update.Pods)
-		for _, value := range update.Pods {
-			name := kubecontainer.GetPodFullName(value)
-			if existing, found := pods[name]; found {
-				// this is a delete
-				delete(pods, name)
-				removePods = append(removePods, existing)
-				continue
-			}
-			// this is a no-op
-		}
-
-	case kubetypes.SET:
-		glog.V(4).Infof("Setting pods for source %s", source)
-		s.markSourceSet(source)
-		// Clear the old map entries by just creating a new map
-		oldPods := pods
-		pods = make(map[string]*api.Pod)
-		updatePodsFunc(update.Pods, oldPods, pods)
-		for name, existing := range oldPods {
-			if _, found := pods[name]; !found {
-				// this is a delete
-				removePods = append(removePods, existing)
-			}
-		}
-
-	default:
-		glog.Warningf("Received invalid update type: %v", update)
-
 	}
 
 	s.pods[source] = pods
@@ -319,31 +263,20 @@ func (s *podStorage) seenSources(sources ...string) bool {
 	return s.sourcesSeen.HasAll(sources...)
 }
 
-func filterInvalidPods(pods []*api.Pod, source string, recorder record.EventRecorder) (filtered []*api.Pod) {
-	names := sets.String{}
+func filterInvalidPods(logger klog.Logger, pods []*v1.Pod, source string, recorder record.EventRecorderLogger) (filtered []*v1.Pod) {
+	names := sets.Set[string]{}
 	for i, pod := range pods {
-		var errlist field.ErrorList
-		if errs := validation.ValidatePod(pod); len(errs) != 0 {
-			errlist = append(errlist, errs...)
-			// If validation fails, don't trust it any further -
-			// even Name could be bad.
-		} else {
-			name := kubecontainer.GetPodFullName(pod)
-			if names.Has(name) {
-				// TODO: when validation becomes versioned, this gets a bit
-				// more complicated.
-				errlist = append(errlist, field.Duplicate(field.NewPath("metadata", "name"), pod.Name))
-			} else {
-				names.Insert(name)
-			}
-		}
-		if len(errlist) > 0 {
-			name := bestPodIdentString(pod)
-			err := errlist.ToAggregate()
-			glog.Warningf("Pod[%d] (%s) from %s failed validation, ignoring: %v", i+1, name, source, err)
-			recorder.Eventf(pod, api.EventTypeWarning, events.FailedValidation, "Error validating pod %s from %s, ignoring: %v", name, source, err)
+		// Pods from each source are assumed to have passed validation individually.
+		// This function only checks if there is any naming conflict.
+		name := kubecontainer.GetPodFullName(pod)
+		if names.Has(name) {
+			logger.Info("Pod failed validation due to duplicate pod name, ignoring", "index", i, "pod", klog.KObj(pod), "source", source)
+			recorder.WithLogger(logger).Eventf(pod, v1.EventTypeWarning, events.FailedValidation, "Error validating pod %s from %s due to duplicate pod name %q, ignoring", format.Pod(pod), source, pod.Name)
 			continue
+		} else {
+			names.Insert(name)
 		}
+
 		filtered = append(filtered, pod)
 	}
 	return
@@ -393,14 +326,14 @@ func isAnnotationMapEqual(existingMap, candidateMap map[string]string) bool {
 }
 
 // recordFirstSeenTime records the first seen time of this pod.
-func recordFirstSeenTime(pod *api.Pod) {
-	glog.V(4).Infof("Receiving a new pod %q", format.Pod(pod))
+func recordFirstSeenTime(logger klog.Logger, pod *v1.Pod) {
+	logger.V(4).Info("Receiving a new pod", "pod", klog.KObj(pod))
 	pod.Annotations[kubetypes.ConfigFirstSeenAnnotationKey] = kubetypes.NewTimestamp().GetString()
 }
 
 // updateAnnotations returns an Annotation map containing the api annotation map plus
 // locally managed annotations
-func updateAnnotations(existing, ref *api.Pod) {
+func updateAnnotations(existing, ref *v1.Pod) {
 	annotations := make(map[string]string, len(ref.Annotations)+len(localAnnotations))
 	for k, v := range ref.Annotations {
 		annotations[k] = v
@@ -413,7 +346,7 @@ func updateAnnotations(existing, ref *api.Pod) {
 	existing.Annotations = annotations
 }
 
-func podsDifferSemantically(existing, ref *api.Pod) bool {
+func podsDifferSemantically(existing, ref *v1.Pod) bool {
 	if reflect.DeepEqual(existing.Spec, ref.Spec) &&
 		reflect.DeepEqual(existing.Labels, ref.Labels) &&
 		reflect.DeepEqual(existing.DeletionTimestamp, ref.DeletionTimestamp) &&
@@ -425,12 +358,12 @@ func podsDifferSemantically(existing, ref *api.Pod) bool {
 }
 
 // checkAndUpdatePod updates existing, and:
-//   * if ref makes a meaningful change, returns needUpdate=true
-//   * if ref makes a meaningful change, and this change is graceful deletion, returns needGracefulDelete=true
-//   * if ref makes no meaningful change, but changes the pod status, returns needReconcile=true
-//   * else return all false
-//   Now, needUpdate, needGracefulDelete and needReconcile should never be both true
-func checkAndUpdatePod(existing, ref *api.Pod) (needUpdate, needReconcile, needGracefulDelete bool) {
+//   - if ref makes a meaningful change, returns needUpdate=true
+//   - if ref makes a meaningful change, and this change is graceful deletion, returns needGracefulDelete=true
+//   - if ref makes no meaningful change, but changes the pod status, returns needReconcile=true
+//   - else return all false
+//     Now, needUpdate, needGracefulDelete and needReconcile should never be both true
+func checkAndUpdatePod(existing, ref *v1.Pod) (needUpdate, needReconcile, needGracefulDelete bool) {
 
 	// 1. this is a reconcile
 	// TODO: it would be better to update the whole object and only preserve certain things
@@ -456,6 +389,7 @@ func checkAndUpdatePod(existing, ref *api.Pod) (needUpdate, needReconcile, needG
 	existing.Labels = ref.Labels
 	existing.DeletionTimestamp = ref.DeletionTimestamp
 	existing.DeletionGracePeriodSeconds = ref.DeletionGracePeriodSeconds
+	existing.Generation = ref.Generation
 	existing.Status = ref.Status
 	updateAnnotations(existing, ref)
 
@@ -470,51 +404,11 @@ func checkAndUpdatePod(existing, ref *api.Pod) (needUpdate, needReconcile, needG
 	return
 }
 
-// Sync sends a copy of the current state through the update channel.
-func (s *podStorage) Sync() {
-	s.updateLock.Lock()
-	defer s.updateLock.Unlock()
-	s.updates <- kubetypes.PodUpdate{Pods: s.MergedState().([]*api.Pod), Op: kubetypes.SET, Source: kubetypes.AllSource}
-}
-
-// Object implements config.Accessor
-func (s *podStorage) MergedState() interface{} {
-	s.podLock.RLock()
-	defer s.podLock.RUnlock()
-	pods := make([]*api.Pod, 0)
-	for _, sourcePods := range s.pods {
-		for _, podRef := range sourcePods {
-			pod, err := api.Scheme.Copy(podRef)
-			if err != nil {
-				glog.Errorf("unable to copy pod: %v", err)
-			}
-			pods = append(pods, pod.(*api.Pod))
-		}
-	}
-	return pods
-}
-
-func bestPodIdentString(pod *api.Pod) string {
-	namespace := pod.Namespace
-	if namespace == "" {
-		namespace = "<empty-namespace>"
-	}
-	name := pod.Name
-	if name == "" {
-		name = "<empty-name>"
-	}
-	return fmt.Sprintf("%s.%s", name, namespace)
-}
-
-func copyPods(sourcePods []*api.Pod) []*api.Pod {
-	pods := []*api.Pod{}
+func copyPods(sourcePods []*v1.Pod) []*v1.Pod {
+	pods := []*v1.Pod{}
 	for _, source := range sourcePods {
 		// Use a deep copy here just in case
-		pod, err := api.Scheme.Copy(source)
-		if err != nil {
-			glog.Errorf("unable to copy pod: %v", err)
-		}
-		pods = append(pods, pod.(*api.Pod))
+		pods = append(pods, source.DeepCopy())
 	}
 	return pods
 }

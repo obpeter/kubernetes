@@ -1,4 +1,25 @@
-assignees:
+# See the OWNERS docs at https://go.k8s.io/owners
+
+approvers:
+  - tallclair
+  - derekwaynecarr
+  - klueska
+  - sjenning
+  - mrunalp
+  - SergeyKanzhelev
+  - endocrimes
+  - ffromani
+emeritus_approvers:
+  - balajismaniam
+  - Random-Liu
   - vishh
-  - timstclair
-  - Random-Liu 
+  - yujuhong
+  - dashpole
+  - ConnorDoyle
+  - ehashman
+reviewers:
+  - bart0sh
+  - endocrimes
+  - sig-node-reviewers
+labels:
+  - sig/node

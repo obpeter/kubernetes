@@ -18,44 +18,59 @@ limitations under the License.
 package slice
 
 import (
-	"sort"
-
-	utilrand "k8s.io/kubernetes/pkg/util/rand"
+	"slices"
 )
 
 // CopyStrings copies the contents of the specified string slice
 // into a new slice.
+//
+// Deprecated: Use slices.Clone instead.
+//
+//go:fix inline
 func CopyStrings(s []string) []string {
-	c := make([]string, len(s))
-	copy(c, s)
-	return c
+	return slices.Clone(s)
 }
 
 // SortStrings sorts the specified string slice in place. It returns the same
 // slice that was provided in order to facilitate method chaining.
+//
+// Deprecated: Use slices.Sort instead.
 func SortStrings(s []string) []string {
-	sort.Strings(s)
+	slices.Sort(s)
 	return s
 }
 
-// ShuffleStrings copies strings from the specified slice into a copy in random
-// order. It returns a new slice.
-func ShuffleStrings(s []string) []string {
-	shuffled := make([]string, len(s))
-	perm := utilrand.Perm(len(s))
-	for i, j := range perm {
-		shuffled[j] = s[i]
+// ContainsString checks if a given slice of strings contains the provided string.
+// If a modifier func is provided, it is called with the slice item before the comparation.
+//
+// Deprecated: Use slices.ContainsFunc or slices.Contains instead.
+func ContainsString(slice []string, s string, modifier func(s string) string) bool {
+	if slices.Contains(slice, s) {
+		return true
 	}
-	return shuffled
+	if modifier != nil {
+		return slices.ContainsFunc(slice, func(item string) bool { return modifier(item) == s })
+	}
+	return false
 }
 
-// Int64Slice attaches the methods of Interface to []int64,
-// sorting in increasing order.
-type Int64Slice []int64
-
-func (p Int64Slice) Len() int           { return len(p) }
-func (p Int64Slice) Less(i, j int) bool { return p[i] < p[j] }
-func (p Int64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-
-// Sorts []int64 in increasing order
-func SortInts64(a []int64) { sort.Sort(Int64Slice(a)) }
+// RemoveString returns a newly created []string that contains all items from slice that
+// are not equal to s and modifier(s) in case modifier func is provided.
+func RemoveString(slice []string, s string, modifier func(s string) string) []string {
+	newSlice := make([]string, 0)
+	for _, item := range slice {
+		if item == s {
+			continue
+		}
+		if modifier != nil && modifier(item) == s {
+			continue
+		}
+		newSlice = append(newSlice, item)
+	}
+	if len(newSlice) == 0 {
+		// Sanitize for unit tests so we don't need to distinguish empty array
+		// and nil.
+		newSlice = nil
+	}
+	return newSlice
+}

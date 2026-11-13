@@ -17,50 +17,96 @@ limitations under the License.
 package resourcequota
 
 import (
+	"context"
 	"fmt"
 
-	"k8s.io/kubernetes/pkg/api"
-	"k8s.io/kubernetes/pkg/api/validation"
-	"k8s.io/kubernetes/pkg/fields"
-	"k8s.io/kubernetes/pkg/labels"
-	"k8s.io/kubernetes/pkg/registry/generic"
-	"k8s.io/kubernetes/pkg/runtime"
-	"k8s.io/kubernetes/pkg/storage"
-	"k8s.io/kubernetes/pkg/util/validation/field"
+	"sigs.k8s.io/structured-merge-diff/v7/fieldpath"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/apiserver/pkg/registry/rest"
+	"k8s.io/apiserver/pkg/storage/names"
+	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/apis/core/validation"
 )
 
 // resourcequotaStrategy implements behavior for ResourceQuota objects
 type resourcequotaStrategy struct {
-	runtime.ObjectTyper
-	api.NameGenerator
+	rest.DeclarativeValidation
+	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating ResourceQuota
 // objects via the REST API.
-var Strategy = resourcequotaStrategy{api.Scheme, api.SimpleNameGenerator}
+var Strategy = resourcequotaStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
 // NamespaceScoped is true for resourcequotas.
 func (resourcequotaStrategy) NamespaceScoped() bool {
 	return true
 }
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (resourcequotaStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
+}
+
 // PrepareForCreate clears fields that are not allowed to be set by end users on creation.
-func (resourcequotaStrategy) PrepareForCreate(ctx api.Context, obj runtime.Object) {
+func (resourcequotaStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
 	resourcequota := obj.(*api.ResourceQuota)
 	resourcequota.Status = api.ResourceQuotaStatus{}
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (resourcequotaStrategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
+func (resourcequotaStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newResourcequota := obj.(*api.ResourceQuota)
 	oldResourcequota := old.(*api.ResourceQuota)
 	newResourcequota.Status = oldResourcequota.Status
 }
 
 // Validate validates a new resourcequota.
-func (resourcequotaStrategy) Validate(ctx api.Context, obj runtime.Object) field.ErrorList {
+func (resourcequotaStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
 	resourcequota := obj.(*api.ResourceQuota)
 	return validation.ValidateResourceQuota(resourcequota)
+}
+
+// all known resource names that we want to check for request <= limit
+var knownResourceNames = []api.ResourceName{
+	api.ResourceCPU,
+	api.ResourceMemory,
+	api.ResourceStorage,
+	api.ResourceEphemeralStorage,
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (resourcequotaStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	resourcequota := obj.(*api.ResourceQuota)
+	var allWarnings []string
+	for _, resourceName := range knownResourceNames {
+		requestResourceName := api.ResourceName(fmt.Sprintf("requests.%s", resourceName))
+		request, requestOK := resourcequota.Spec.Hard[requestResourceName]
+		if !requestOK && (resourceName == api.ResourceCPU || resourceName == api.ResourceMemory) {
+			// try the bare name for cpu and memory
+			request, requestOK = resourcequota.Spec.Hard[resourceName]
+			if requestOK {
+				requestResourceName = resourceName
+			}
+		}
+		limitResourceName := api.ResourceName(fmt.Sprintf("limits.%s", resourceName))
+		limit, limitOK := resourcequota.Spec.Hard[limitResourceName]
+		if requestOK && limitOK && request.Cmp(limit) > 0 {
+			allWarnings = append(allWarnings, fmt.Sprintf("ResourceQuota %s (%s) should be less than %s (%s)",
+				requestResourceName, request.String(), limitResourceName, limit.String()))
+		}
+	}
+	return allWarnings
 }
 
 // Canonicalize normalizes the object after validation.
@@ -68,17 +114,22 @@ func (resourcequotaStrategy) Canonicalize(obj runtime.Object) {
 }
 
 // AllowCreateOnUpdate is false for resourcequotas.
-func (resourcequotaStrategy) AllowCreateOnUpdate() bool {
+func (resourcequotaStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (resourcequotaStrategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
-	errorList := validation.ValidateResourceQuota(obj.(*api.ResourceQuota))
-	return append(errorList, validation.ValidateResourceQuotaUpdate(obj.(*api.ResourceQuota), old.(*api.ResourceQuota))...)
+func (resourcequotaStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	newObj, oldObj := obj.(*api.ResourceQuota), old.(*api.ResourceQuota)
+	return validation.ValidateResourceQuotaUpdate(newObj, oldObj)
 }
 
-func (resourcequotaStrategy) AllowUnconditionalUpdate() bool {
+// WarningsOnUpdate returns warnings for the given update.
+func (resourcequotaStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
+}
+
+func (resourcequotaStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -86,34 +137,32 @@ type resourcequotaStatusStrategy struct {
 	resourcequotaStrategy
 }
 
+// StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = resourcequotaStatusStrategy{Strategy}
 
-func (resourcequotaStatusStrategy) PrepareForUpdate(ctx api.Context, obj, old runtime.Object) {
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (resourcequotaStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+
+	return fields
+}
+
+func (resourcequotaStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
 	newResourcequota := obj.(*api.ResourceQuota)
 	oldResourcequota := old.(*api.ResourceQuota)
 	newResourcequota.Spec = oldResourcequota.Spec
 }
 
-func (resourcequotaStatusStrategy) ValidateUpdate(ctx api.Context, obj, old runtime.Object) field.ErrorList {
+func (resourcequotaStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
 	return validation.ValidateResourceQuotaStatusUpdate(obj.(*api.ResourceQuota), old.(*api.ResourceQuota))
 }
 
-// MatchResourceQuota returns a generic matcher for a given label and field selector.
-func MatchResourceQuota(label labels.Selector, field fields.Selector) storage.SelectionPredicate {
-	return storage.SelectionPredicate{
-		Label: label,
-		Field: field,
-		GetAttrs: func(obj runtime.Object) (labels.Set, fields.Set, error) {
-			resourcequotaObj, ok := obj.(*api.ResourceQuota)
-			if !ok {
-				return nil, nil, fmt.Errorf("not a resourcequota")
-			}
-			return labels.Set(resourcequotaObj.Labels), ResourceQuotaToSelectableFields(resourcequotaObj), nil
-		},
-	}
-}
-
-// ResourceQuotaToSelectableFields returns a field set that represents the object
-func ResourceQuotaToSelectableFields(resourcequota *api.ResourceQuota) fields.Set {
-	return generic.ObjectMetaFieldsSet(&resourcequota.ObjectMeta, true)
+// WarningsOnUpdate returns warnings for the given update.
+func (resourcequotaStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }

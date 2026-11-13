@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -14,13 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This script verifies whether a code update is needed.
+# Usage: `hack/verify-codegen.sh <parameters for update-codegen.sh>`.
+
 set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/..
-source "${KUBE_ROOT}/hack/lib/init.sh"
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/..
+source "${KUBE_ROOT}/hack/lib/verify-generated.sh"
 
-kube::golang::setup_env
+export UPDATE_API_KNOWN_VIOLATIONS=true
 
-"${KUBE_ROOT}/hack/update-codegen.sh" --verify-only
+kube::verify::generated "Generated files need to be updated" "Please run 'hack/update-codegen.sh'" hack/update-codegen.sh "$@"

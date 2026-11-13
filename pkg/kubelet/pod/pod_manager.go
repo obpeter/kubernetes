@@ -14,14 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+//go:generate mockery
 package pod
 
 import (
 	"sync"
 
-	"k8s.io/kubernetes/pkg/api"
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
-	"k8s.io/kubernetes/pkg/types"
+	"k8s.io/kubernetes/pkg/kubelet/metrics"
+	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 )
 
 // Manager stores and manages access to pods, maintaining the mappings
@@ -40,40 +43,51 @@ import (
 // pod. When a static pod gets deleted, the associated orphaned mirror pod
 // will also be removed.
 type Manager interface {
-	// GetPods returns the regular pods bound to the kubelet and their spec.
-	GetPods() []*api.Pod
-	// GetPodByName returns the (non-mirror) pod that matches full name, as well as
+	// GetPodByFullName returns the (non-mirror) pod that matches full name, as well as
 	// whether the pod was found.
-	GetPodByFullName(podFullName string) (*api.Pod, bool)
+	GetPodByFullName(podFullName string) (*v1.Pod, bool)
 	// GetPodByName provides the (non-mirror) pod that matches namespace and
 	// name, as well as whether the pod was found.
-	GetPodByName(namespace, name string) (*api.Pod, bool)
+	GetPodByName(namespace, name string) (*v1.Pod, bool)
 	// GetPodByUID provides the (non-mirror) pod that matches pod UID, as well as
 	// whether the pod is found.
-	GetPodByUID(types.UID) (*api.Pod, bool)
+	GetPodByUID(types.UID) (*v1.Pod, bool)
 	// GetPodByMirrorPod returns the static pod for the given mirror pod and
-	// whether it was known to the pod manger.
-	GetPodByMirrorPod(*api.Pod) (*api.Pod, bool)
+	// whether it was known to the pod manager.
+	GetPodByMirrorPod(*v1.Pod) (*v1.Pod, bool)
 	// GetMirrorPodByPod returns the mirror pod for the given static pod and
 	// whether it was known to the pod manager.
-	GetMirrorPodByPod(*api.Pod) (*api.Pod, bool)
-	// GetPodsAndMirrorPods returns the both regular and mirror pods.
-	GetPodsAndMirrorPods() ([]*api.Pod, []*api.Pod)
+	GetMirrorPodByPod(*v1.Pod) (*v1.Pod, bool)
+	// GetPodAndMirrorPod returns the complement for a pod - if a pod was provided
+	// and a mirror pod can be found, return it. If a mirror pod is provided and
+	// the pod can be found, return it and true for wasMirror.
+	GetPodAndMirrorPod(*v1.Pod) (pod, mirrorPod *v1.Pod, wasMirror bool)
+
+	// GetPods returns the regular pods bound to the kubelet and their spec.
+	GetPods() []*v1.Pod
+
+	// GetPodsAndMirrorPods returns the set of pods, the set of mirror pods, and
+	// the pod fullnames of any orphaned mirror pods.
+	GetPodsAndMirrorPods() (allPods []*v1.Pod, allMirrorPods []*v1.Pod, orphanedMirrorPodFullnames []string)
+
+	// GetStaticPodToMirrorPodMap return a map of static pod to its corresponding
+	// mirror pods. It is possible that there is no mirror pod for a static pod
+	// if kubelet is running in standalone mode or is in the process of creating
+	// the mirror pod and in that case, the mirror pod is nil.
+	GetStaticPodToMirrorPodMap() map[*v1.Pod]*v1.Pod
+
 	// SetPods replaces the internal pods with the new pods.
 	// It is currently only used for testing.
-	SetPods(pods []*api.Pod)
+	SetPods(pods []*v1.Pod)
 	// AddPod adds the given pod to the manager.
-	AddPod(pod *api.Pod)
+	AddPod(pod *v1.Pod)
 	// UpdatePod updates the given pod in the manager.
-	UpdatePod(pod *api.Pod)
-	// DeletePod deletes the given pod from the manager.  For mirror pods,
+	UpdatePod(pod *v1.Pod)
+	// RemovePod deletes the given pod from the manager.  For mirror pods,
 	// this means deleting the mappings related to mirror pods.  For non-
 	// mirror pods, this means deleting from indexes for all non-mirror pods.
-	DeletePod(pod *api.Pod)
-	// DeleteOrphanedMirrorPods deletes all mirror pods which do not have
-	// associated static pods. This method sends deletion requests to the API
-	// server, but does NOT modify the internal pod storage in basicManager.
-	DeleteOrphanedMirrorPods()
+	RemovePod(pod *v1.Pod)
+
 	// TranslatePodUID returns the actual UID of a pod. If the UID belongs to
 	// a mirror pod, returns the UID of its static pod. Otherwise, returns the
 	// original UID.
@@ -81,164 +95,198 @@ type Manager interface {
 	// All public-facing functions should perform this translation for UIDs
 	// because user may provide a mirror pod UID, which is not recognized by
 	// internal Kubelet functions.
-	TranslatePodUID(uid types.UID) types.UID
+	TranslatePodUID(uid types.UID) kubetypes.ResolvedPodUID
 	// GetUIDTranslations returns the mappings of static pod UIDs to mirror pod
 	// UIDs and mirror pod UIDs to static pod UIDs.
-	GetUIDTranslations() (podToMirror, mirrorToPod map[types.UID]types.UID)
-	// IsMirrorPodOf returns true if mirrorPod is a correct representation of
-	// pod; false otherwise.
-	IsMirrorPodOf(mirrorPod, pod *api.Pod) bool
-
-	MirrorClient
+	GetUIDTranslations() (podToMirror map[kubetypes.ResolvedPodUID]kubetypes.MirrorPodUID, mirrorToPod map[kubetypes.MirrorPodUID]kubetypes.ResolvedPodUID)
 }
 
-// basicManager is a functional Manger.
+// basicManager is a functional Manager.
 //
 // All fields in basicManager are read-only and are updated calling SetPods,
-// AddPod, UpdatePod, or DeletePod.
+// AddPod, UpdatePod, or RemovePod.
 type basicManager struct {
 	// Protects all internal maps.
 	lock sync.RWMutex
 
 	// Regular pods indexed by UID.
-	podByUID map[types.UID]*api.Pod
+	podByUID map[kubetypes.ResolvedPodUID]*v1.Pod
 	// Mirror pods indexed by UID.
-	mirrorPodByUID map[types.UID]*api.Pod
+	mirrorPodByUID map[kubetypes.MirrorPodUID]*v1.Pod
 
 	// Pods indexed by full name for easy access.
-	podByFullName       map[string]*api.Pod
-	mirrorPodByFullName map[string]*api.Pod
+	podByFullName       map[string]*v1.Pod
+	mirrorPodByFullName map[string]*v1.Pod
 
 	// Mirror pod UID to pod UID map.
-	translationByUID map[types.UID]types.UID
-
-	// A mirror pod client to create/delete mirror pods.
-	MirrorClient
+	translationByUID map[kubetypes.MirrorPodUID]kubetypes.ResolvedPodUID
 }
 
 // NewBasicPodManager returns a functional Manager.
-func NewBasicPodManager(client MirrorClient) Manager {
+func NewBasicPodManager() Manager {
 	pm := &basicManager{}
-	pm.MirrorClient = client
 	pm.SetPods(nil)
 	return pm
 }
 
-// Set the internal pods based on the new pods.
-func (pm *basicManager) SetPods(newPods []*api.Pod) {
+// SetPods set the internal pods based on the new pods.
+func (pm *basicManager) SetPods(newPods []*v1.Pod) {
 	pm.lock.Lock()
 	defer pm.lock.Unlock()
 
-	pm.podByUID = make(map[types.UID]*api.Pod)
-	pm.podByFullName = make(map[string]*api.Pod)
-	pm.mirrorPodByUID = make(map[types.UID]*api.Pod)
-	pm.mirrorPodByFullName = make(map[string]*api.Pod)
-	pm.translationByUID = make(map[types.UID]types.UID)
+	pm.podByUID = make(map[kubetypes.ResolvedPodUID]*v1.Pod)
+	pm.podByFullName = make(map[string]*v1.Pod)
+	pm.mirrorPodByUID = make(map[kubetypes.MirrorPodUID]*v1.Pod)
+	pm.mirrorPodByFullName = make(map[string]*v1.Pod)
+	pm.translationByUID = make(map[kubetypes.MirrorPodUID]kubetypes.ResolvedPodUID)
 
 	pm.updatePodsInternal(newPods...)
 }
 
-func (pm *basicManager) AddPod(pod *api.Pod) {
+func (pm *basicManager) AddPod(pod *v1.Pod) {
 	pm.UpdatePod(pod)
 }
 
-func (pm *basicManager) UpdatePod(pod *api.Pod) {
+func (pm *basicManager) UpdatePod(pod *v1.Pod) {
 	pm.lock.Lock()
 	defer pm.lock.Unlock()
 	pm.updatePodsInternal(pod)
 }
 
+// updateMetrics updates the metrics surfaced by the pod manager.
+// oldPod or newPod may be nil to signify creation or deletion.
+func updateMetrics(oldPod, newPod *v1.Pod) {
+	var numEC int
+	if oldPod != nil {
+		numEC -= len(oldPod.Spec.EphemeralContainers)
+	}
+	if newPod != nil {
+		numEC += len(newPod.Spec.EphemeralContainers)
+	}
+	if numEC != 0 {
+		metrics.ManagedEphemeralContainers.Add(float64(numEC))
+	}
+}
+
 // updatePodsInternal replaces the given pods in the current state of the
-// manager, updating the various indices.  The caller is assumed to hold the
+// manager, updating the various indices. The caller is assumed to hold the
 // lock.
-func (pm *basicManager) updatePodsInternal(pods ...*api.Pod) {
+func (pm *basicManager) updatePodsInternal(pods ...*v1.Pod) {
 	for _, pod := range pods {
 		podFullName := kubecontainer.GetPodFullName(pod)
-		if IsMirrorPod(pod) {
-			pm.mirrorPodByUID[pod.UID] = pod
+		// This logic relies on a static pod and its mirror to have the same name.
+		// It is safe to type convert here due to the IsMirrorPod guard.
+		if kubetypes.IsMirrorPod(pod) {
+			mirrorPodUID := kubetypes.MirrorPodUID(pod.UID)
+			pm.mirrorPodByUID[mirrorPodUID] = pod
 			pm.mirrorPodByFullName[podFullName] = pod
 			if p, ok := pm.podByFullName[podFullName]; ok {
-				pm.translationByUID[pod.UID] = p.UID
+				pm.translationByUID[mirrorPodUID] = kubetypes.ResolvedPodUID(p.UID)
 			}
 		} else {
-			pm.podByUID[pod.UID] = pod
+			resolvedPodUID := kubetypes.ResolvedPodUID(pod.UID)
+			updateMetrics(pm.podByUID[resolvedPodUID], pod)
+			pm.podByUID[resolvedPodUID] = pod
 			pm.podByFullName[podFullName] = pod
 			if mirror, ok := pm.mirrorPodByFullName[podFullName]; ok {
-				pm.translationByUID[mirror.UID] = pod.UID
+				pm.translationByUID[kubetypes.MirrorPodUID(mirror.UID)] = resolvedPodUID
 			}
 		}
 	}
 }
 
-func (pm *basicManager) DeletePod(pod *api.Pod) {
+func (pm *basicManager) RemovePod(pod *v1.Pod) {
+	updateMetrics(pod, nil)
 	pm.lock.Lock()
 	defer pm.lock.Unlock()
 	podFullName := kubecontainer.GetPodFullName(pod)
-	if IsMirrorPod(pod) {
-		delete(pm.mirrorPodByUID, pod.UID)
+	// It is safe to type convert here due to the IsMirrorPod guard.
+	if kubetypes.IsMirrorPod(pod) {
+		mirrorPodUID := kubetypes.MirrorPodUID(pod.UID)
+		delete(pm.mirrorPodByUID, mirrorPodUID)
 		delete(pm.mirrorPodByFullName, podFullName)
-		delete(pm.translationByUID, pod.UID)
+		delete(pm.translationByUID, mirrorPodUID)
 	} else {
-		delete(pm.podByUID, pod.UID)
+		delete(pm.podByUID, kubetypes.ResolvedPodUID(pod.UID))
 		delete(pm.podByFullName, podFullName)
 	}
 }
 
-func (pm *basicManager) GetPods() []*api.Pod {
+func (pm *basicManager) GetPods() []*v1.Pod {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
 	return podsMapToPods(pm.podByUID)
 }
 
-func (pm *basicManager) GetPodsAndMirrorPods() ([]*api.Pod, []*api.Pod) {
+func (pm *basicManager) GetPodsAndMirrorPods() (allPods []*v1.Pod, allMirrorPods []*v1.Pod, orphanedMirrorPodFullnames []string) {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
-	pods := podsMapToPods(pm.podByUID)
-	mirrorPods := podsMapToPods(pm.mirrorPodByUID)
-	return pods, mirrorPods
+	allPods = podsMapToPods(pm.podByUID)
+	allMirrorPods = mirrorPodsMapToMirrorPods(pm.mirrorPodByUID)
+
+	for podFullName := range pm.mirrorPodByFullName {
+		if _, ok := pm.podByFullName[podFullName]; !ok {
+			orphanedMirrorPodFullnames = append(orphanedMirrorPodFullnames, podFullName)
+		}
+	}
+	return allPods, allMirrorPods, orphanedMirrorPodFullnames
 }
 
-func (pm *basicManager) GetPodByUID(uid types.UID) (*api.Pod, bool) {
+func (pm *basicManager) GetStaticPodToMirrorPodMap() map[*v1.Pod]*v1.Pod {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
-	pod, ok := pm.podByUID[uid]
+	staticPodsMapToMirrorPods := make(map[*v1.Pod]*v1.Pod)
+	for _, pod := range podsMapToPods(pm.podByUID) {
+		if kubetypes.IsStaticPod(pod) {
+			staticPodsMapToMirrorPods[pod] = pm.mirrorPodByFullName[kubecontainer.GetPodFullName(pod)]
+		}
+	}
+	return staticPodsMapToMirrorPods
+}
+
+func (pm *basicManager) GetPodByUID(uid types.UID) (*v1.Pod, bool) {
+	pm.lock.RLock()
+	defer pm.lock.RUnlock()
+	pod, ok := pm.podByUID[kubetypes.ResolvedPodUID(uid)] // Safe conversion, map only holds non-mirrors.
 	return pod, ok
 }
 
-func (pm *basicManager) GetPodByName(namespace, name string) (*api.Pod, bool) {
+func (pm *basicManager) GetPodByName(namespace, name string) (*v1.Pod, bool) {
 	podFullName := kubecontainer.BuildPodFullName(name, namespace)
 	return pm.GetPodByFullName(podFullName)
 }
 
-func (pm *basicManager) GetPodByFullName(podFullName string) (*api.Pod, bool) {
+func (pm *basicManager) GetPodByFullName(podFullName string) (*v1.Pod, bool) {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
 	pod, ok := pm.podByFullName[podFullName]
 	return pod, ok
 }
 
-func (pm *basicManager) TranslatePodUID(uid types.UID) types.UID {
+func (pm *basicManager) TranslatePodUID(uid types.UID) kubetypes.ResolvedPodUID {
+	// It is safe to type convert to a resolved UID because type conversion is idempotent.
 	if uid == "" {
-		return uid
+		return kubetypes.ResolvedPodUID(uid)
 	}
 
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
-	if translated, ok := pm.translationByUID[uid]; ok {
+	if translated, ok := pm.translationByUID[kubetypes.MirrorPodUID(uid)]; ok {
 		return translated
 	}
-	return uid
+	return kubetypes.ResolvedPodUID(uid)
 }
 
-func (pm *basicManager) GetUIDTranslations() (podToMirror, mirrorToPod map[types.UID]types.UID) {
+func (pm *basicManager) GetUIDTranslations() (podToMirror map[kubetypes.ResolvedPodUID]kubetypes.MirrorPodUID,
+	mirrorToPod map[kubetypes.MirrorPodUID]kubetypes.ResolvedPodUID) {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
 
-	podToMirror = make(map[types.UID]types.UID, len(pm.translationByUID))
-	mirrorToPod = make(map[types.UID]types.UID, len(pm.translationByUID))
+	podToMirror = make(map[kubetypes.ResolvedPodUID]kubetypes.MirrorPodUID, len(pm.translationByUID))
+	mirrorToPod = make(map[kubetypes.MirrorPodUID]kubetypes.ResolvedPodUID, len(pm.translationByUID))
 	// Insert empty translation mapping for all static pods.
 	for uid, pod := range pm.podByUID {
-		if !IsStaticPod(pod) {
+		if !kubetypes.IsStaticPod(pod) {
 			continue
 		}
 		podToMirror[uid] = ""
@@ -254,26 +302,8 @@ func (pm *basicManager) GetUIDTranslations() (podToMirror, mirrorToPod map[types
 	return podToMirror, mirrorToPod
 }
 
-func (pm *basicManager) getOrphanedMirrorPodNames() []string {
-	pm.lock.RLock()
-	defer pm.lock.RUnlock()
-	var podFullNames []string
-	for podFullName := range pm.mirrorPodByFullName {
-		if _, ok := pm.podByFullName[podFullName]; !ok {
-			podFullNames = append(podFullNames, podFullName)
-		}
-	}
-	return podFullNames
-}
-
-func (pm *basicManager) DeleteOrphanedMirrorPods() {
-	podFullNames := pm.getOrphanedMirrorPodNames()
-	for _, podFullName := range podFullNames {
-		pm.MirrorClient.DeleteMirrorPod(podFullName)
-	}
-}
-
-func (pm *basicManager) IsMirrorPodOf(mirrorPod, pod *api.Pod) bool {
+// IsMirrorPodOf returns true if pod and mirrorPod are associated with each other.
+func IsMirrorPodOf(mirrorPod, pod *v1.Pod) bool {
 	// Check name and namespace first.
 	if pod.Name != mirrorPod.Name || pod.Namespace != mirrorPod.Namespace {
 		return false
@@ -285,24 +315,43 @@ func (pm *basicManager) IsMirrorPodOf(mirrorPod, pod *api.Pod) bool {
 	return hash == getPodHash(pod)
 }
 
-func podsMapToPods(UIDMap map[types.UID]*api.Pod) []*api.Pod {
-	pods := make([]*api.Pod, 0, len(UIDMap))
+func podsMapToPods(UIDMap map[kubetypes.ResolvedPodUID]*v1.Pod) []*v1.Pod {
+	pods := make([]*v1.Pod, 0, len(UIDMap))
 	for _, pod := range UIDMap {
 		pods = append(pods, pod)
 	}
 	return pods
 }
 
-func (pm *basicManager) GetMirrorPodByPod(pod *api.Pod) (*api.Pod, bool) {
+func mirrorPodsMapToMirrorPods(UIDMap map[kubetypes.MirrorPodUID]*v1.Pod) []*v1.Pod {
+	pods := make([]*v1.Pod, 0, len(UIDMap))
+	for _, pod := range UIDMap {
+		pods = append(pods, pod)
+	}
+	return pods
+}
+
+func (pm *basicManager) GetMirrorPodByPod(pod *v1.Pod) (*v1.Pod, bool) {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
 	mirrorPod, ok := pm.mirrorPodByFullName[kubecontainer.GetPodFullName(pod)]
 	return mirrorPod, ok
 }
 
-func (pm *basicManager) GetPodByMirrorPod(mirrorPod *api.Pod) (*api.Pod, bool) {
+func (pm *basicManager) GetPodByMirrorPod(mirrorPod *v1.Pod) (*v1.Pod, bool) {
 	pm.lock.RLock()
 	defer pm.lock.RUnlock()
 	pod, ok := pm.podByFullName[kubecontainer.GetPodFullName(mirrorPod)]
 	return pod, ok
+}
+
+func (pm *basicManager) GetPodAndMirrorPod(aPod *v1.Pod) (pod, mirrorPod *v1.Pod, wasMirror bool) {
+	pm.lock.RLock()
+	defer pm.lock.RUnlock()
+
+	fullName := kubecontainer.GetPodFullName(aPod)
+	if kubetypes.IsMirrorPod(aPod) {
+		return pm.podByFullName[fullName], aPod, true
+	}
+	return aPod, pm.mirrorPodByFullName[fullName], false
 }

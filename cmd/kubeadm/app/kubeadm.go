@@ -17,30 +17,33 @@ limitations under the License.
 package app
 
 import (
+	"flag"
 	"os"
 
-	"github.com/renstrom/dedent"
 	"github.com/spf13/pflag"
 
+	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/klog/v2"
+
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd"
-	cmdutil "k8s.io/kubernetes/pkg/kubectl/cmd/util"
-	"k8s.io/kubernetes/pkg/util/logs"
 )
 
-var AlphaWarningOnExit = dedent.Dedent(`
-	kubeadm: I am an alpha version, my authors welcome your feedback and bug reports
-	kubeadm: please create issue an using https://github.com/kubernetes/kubernetes/issues/new
-	kubeadm: and make sure to mention @kubernetes/sig-cluster-lifecycle. Thank you!
-`)
-
+// Run creates and executes new kubeadm command
 func Run() error {
-	logs.InitLogs()
-	defer logs.FlushLogs()
+	var allFlags flag.FlagSet
+	klog.InitFlags(&allFlags)
+	// only add the flags that are still supported for kubeadm
+	allFlags.VisitAll(func(f *flag.Flag) {
+		switch f.Name {
+		// kubeadm only exposes the klog flags covered in https://features.k8s.io/2845
+		case "v", "vmodule":
+			flag.CommandLine.Var(f.Value, f.Name, f.Usage)
+		}
+	})
 
-	// We do not want these flags to show up in --help
-	pflag.CommandLine.MarkHidden("google-json-key")
-	pflag.CommandLine.MarkHidden("log-flush-frequency")
+	pflag.CommandLine.SetNormalizeFunc(cliflag.WordSepNormalizeFunc)
+	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 
-	cmd := cmd.NewKubeadmCommand(cmdutil.NewFactory(nil), os.Stdin, os.Stdout, os.Stderr)
+	cmd := cmd.NewKubeadmCommand(os.Stdin, os.Stdout, os.Stderr)
 	return cmd.Execute()
 }
